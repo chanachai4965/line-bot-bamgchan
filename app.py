@@ -1,4 +1,3 @@
-gunicorn app:app
 """
 LINE Bot - ระบบสืบค้นผลการจับกุม สน.บางชัน
 ติดตั้ง: pip install flask line-bot-sdk pandas openpyxl
