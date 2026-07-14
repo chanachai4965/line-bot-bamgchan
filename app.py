@@ -72,8 +72,10 @@ def search_by_name(keyword: str, limit=25):
 
 
 def search_by_location(keyword: str, limit=50):
-    """ค้นหาสถานที่ — ค้นในทุก record ที่มี location ตรงกัน"""
+    """ค้นหาสถานที่ — ค้น exact แล้ว fallback แบบ token-split"""
     conn = get_conn()
+
+    # รอบ 1: ค้น full keyword
     rows = conn.execute(
         """SELECT name, date_str, charge, evidence, location, year_be, month_num
            FROM arrests
@@ -83,17 +85,34 @@ def search_by_location(keyword: str, limit=50):
         (f"%{keyword}%", limit)
     ).fetchall()
 
-    # ถ้าไม่เจอ ลองค้น charge หรือ date ด้วย (fallback)
-    if not rows:
+    # รอบ 2: ถ้าไม่เจอ → ลองตัดคำ prefix ออก แล้วค้นส่วนหลัก
+    # เช่น "ชุมชนสุเหล่าแดง" → ค้น "สุเหล่า" หรือ "แดง" ทีละส่วน
+    if not rows and len(keyword) >= 3:
+        # ตัดคำนำหน้าที่รู้จัก
+        stripped = re.sub(r'^(ชุมชน|ซอย|ถ\.|ถนน|หมู่บ้าน|สน\.|ริม|แยก)\s*', '', keyword).strip()
+        if stripped and stripped != keyword:
+            rows = conn.execute(
+                """SELECT name, date_str, charge, evidence, location, year_be, month_num
+                   FROM arrests
+                   WHERE location LIKE ? AND location != ''
+                   ORDER BY year_be, month_num, date_str
+                   LIMIT ?""",
+                (f"%{stripped}%", limit)
+            ).fetchall()
+
+    # รอบ 3: ยังไม่เจอ → ค้นจากส่วนท้ายของคำ (เช่น "แดง" จาก "สุเหล่าแดง")
+    if not rows and len(keyword) >= 3:
+        # เอา 3 ตัวท้าย
+        suffix = keyword[-3:]
         rows = conn.execute(
             """SELECT name, date_str, charge, evidence, location, year_be, month_num
                FROM arrests
-               WHERE (location LIKE ? OR charge LIKE ?)
-                 AND location != ''
-               ORDER BY year_be, month_num
+               WHERE location LIKE ? AND location != ''
+               ORDER BY year_be, month_num, date_str
                LIMIT ?""",
-            (f"%{keyword}%", f"%{keyword}%", limit)
+            (f"%{suffix}%", limit)
         ).fetchall()
+
     conn.close()
     return rows
 
@@ -422,27 +441,100 @@ def build_location_result(rows, keyword: str) -> list:
     return messages
 
 
+DRUG_KEYWORDS = ['ยาบ้า', 'ยาไอซ์', 'ยาเสพ', 'กัญชา', 'เสพ', 'เมทแอมเฟต',
+                 'ครอบครองยา', 'จำหน่ายยา', 'พืชกระท่อม', 'ฝิ่น', 'เฮโรอีน',
+                 'ครอบครองและเสพ', 'ร่วมกันครอบครองยา', 'ครอบครองยาเสพติด',
+                 'เสพยาเสพ', 'ครอบครองยา']
+WARRANT_KEYWORDS = ['หมายจับ', 'ตามหมาย', 'หมาย จ.', 'หมาย จพ.']
+
+
+def categorize_charge(charge: str) -> str:
+    """จัดหมวดข้อหา → ยาเสพติด / หมายจับ / คดีอื่นๆ"""
+    if not charge or charge.strip() in ('', '-', 'nan'):
+        return 'คดีอื่นๆ'
+    for kw in WARRANT_KEYWORDS:
+        if kw in charge:
+            return 'หมายจับ'
+    for kw in DRUG_KEYWORDS:
+        if kw in charge:
+            return 'ยาเสพติด'
+    return 'คดีอื่นๆ'
+
+
 def build_month_result(rows, month_num: int, year_be: int) -> list:
-    """สรุปรายเดือน"""
+    """สรุปรายเดือน พร้อมแยกหมวด ยาเสพติด / หมายจับ / คดีอื่นๆ"""
     month_name = THAI_MONTH_NAME.get(month_num, str(month_num))
     if not rows:
         return build_not_found(f"ไม่พบข้อมูลเดือน{month_name} พ.ศ.{year_be}")
 
     total = len(rows)
+
+    # แยกหมวดหมู่หลัก
+    cat_count = {'ยาเสพติด': 0, 'หมายจับ': 0, 'คดีอื่นๆ': 0}
     charge_count: dict = {}
     for r in rows:
-        c = r['charge'] or 'ไม่ระบุ'
-        charge_count[c] = charge_count.get(c, 0) + 1
+        c = r['charge'] or ''
+        cat = categorize_charge(c)
+        cat_count[cat] = cat_count.get(cat, 0) + 1
+        label = c if c else 'ไม่ระบุ'
+        charge_count[label] = charge_count.get(label, 0) + 1
 
     # ── Flex summary card ──
     body = [
         _row("เดือน", f"{month_name} พ.ศ.{year_be}"),
-        _row("จำนวนผู้ต้องหา", f"{total} ราย"),
+        _row("จำนวนผู้ต้องหารวม", f"{total} ราย"),
         _sep(),
-        _text("📋 สรุปตามข้อหา:", weight="bold", size="sm"),
+        _text("📊 แยกตามประเภทคดี:", weight="bold", size="sm"),
+        {
+            "type": "box", "layout": "horizontal", "margin": "sm",
+            "contents": [
+                {
+                    "type": "box", "layout": "vertical", "flex": 1,
+                    "backgroundColor": "#FFF3E0", "cornerRadius": "8px",
+                    "paddingAll": "8px",
+                    "contents": [
+                        _text("💊", size="xl", align="center"),
+                        _text("ยาเสพติด", size="xs", align="center", color=CLR_HEADER_RED),
+                        _text(str(cat_count['ยาเสพติด']), size="lg",
+                              align="center", weight="bold", color=CLR_HEADER_RED),
+                        _text("ราย", size="xs", align="center", color=CLR_GRAY),
+                    ]
+                },
+                {"type": "box", "layout": "vertical", "width": "8px", "contents": []},
+                {
+                    "type": "box", "layout": "vertical", "flex": 1,
+                    "backgroundColor": "#E3F2FD", "cornerRadius": "8px",
+                    "paddingAll": "8px",
+                    "contents": [
+                        _text("📜", size="xl", align="center"),
+                        _text("หมายจับ", size="xs", align="center", color=CLR_HEADER_BLUE),
+                        _text(str(cat_count['หมายจับ']), size="lg",
+                              align="center", weight="bold", color=CLR_HEADER_BLUE),
+                        _text("ราย", size="xs", align="center", color=CLR_GRAY),
+                    ]
+                },
+                {"type": "box", "layout": "vertical", "width": "8px", "contents": []},
+                {
+                    "type": "box", "layout": "vertical", "flex": 1,
+                    "backgroundColor": "#F3E5F5", "cornerRadius": "8px",
+                    "paddingAll": "8px",
+                    "contents": [
+                        _text("⚖️", size="xl", align="center"),
+                        _text("คดีอื่นๆ", size="xs", align="center", color=CLR_HEADER_PURPLE),
+                        _text(str(cat_count['คดีอื่นๆ']), size="lg",
+                              align="center", weight="bold", color=CLR_HEADER_PURPLE),
+                        _text("ราย", size="xs", align="center", color=CLR_GRAY),
+                    ]
+                },
+            ]
+        },
+        _sep(),
+        _text("📋 สรุปตามข้อหา (ทั้งหมด):", weight="bold", size="sm"),
     ]
     for c, cnt in sorted(charge_count.items(), key=lambda x: -x[1]):
-        body.append(_row(f"  • {c}", f"{cnt} ราย"))
+        cat = categorize_charge(c)
+        icon = "💊" if cat == 'ยาเสพติด' else ("📜" if cat == 'หมายจับ' else "⚖️")
+        body.append(_row(f"{icon} {c}", f"{cnt} ราย"))
 
     bubble = _bubble(f"📅 {month_name} พ.ศ.{year_be}", CLR_HEADER_ORANGE, body)
     messages = [flex(f"สรุปเดือน{month_name} {year_be}: {total} ราย", bubble)]
@@ -678,6 +770,29 @@ def parse_year_only(text: str):
     return None
 
 
+# ─── Location prefix patterns (auto-detect) ──────────────────────────────────
+
+# ถ้าข้อความขึ้นต้นด้วยคำเหล่านี้ ให้ถือว่าเป็นการค้นหาสถานที่ทันที
+LOCATION_PREFIX_RE = re.compile(
+    r'^(ชุมชน|ซอย|ถ\.|ถนน|หมู่บ้าน|สน\.|ริมคลอง|ริมถนน|ริม|แยก|ลาน|ตลาด|ห้าง|อาคาร|บริเวณ)'
+)
+
+
+def _is_direct_month_year(text: str):
+    """
+    ตรวจว่าข้อความเป็น month+year โดยตรง ไม่มี prefix เช่น
+    'มิ.ย.69', 'ม.ค. 69', 'มกราคม 69', 'ม.ค.2569'
+    คืน (month_num, year_be) หรือ (None, None)
+    """
+    month_num, year_be = parse_month_year(text)
+    if not month_num or not year_be:
+        return None, None
+    # ตรวจว่าข้อความสั้น (ไม่ใช่ประโยคยาวที่บังเอิญมีเดือน)
+    if len(text.strip()) <= 20:
+        return month_num, year_be
+    return None, None
+
+
 # ─── Intent Router ────────────────────────────────────────────────────────────
 
 def handle_message(text: str) -> list:
@@ -685,25 +800,33 @@ def handle_message(text: str) -> list:
     t = text.strip()
     t_lower = t.lower()
 
-    # Help
+    # ── Help ──
     if any(k in t_lower for k in ['ช่วย', 'help', '?', 'คำสั่ง', 'menu', 'เมนู']):
         return build_help()
 
-    # ค้นหาบุคคล
+    # ── สถิติ ──
+    if any(k in t for k in ['สถิติ', 'ภาพรวม', 'รวมทั้งหมด', 'รายงาน']):
+        return build_stats()
+
+    # ── ค้นหาบุคคล (มี prefix) ──
     if re.match(r'^(ค้นหา|หา)\s', t):
         keyword = re.sub(r'^(ค้นหา|หา)\s+', '', t).strip()
         if not keyword:
             return [TextMessage(text="กรุณาระบุชื่อ เช่น: ค้นหา สมชาย")]
         return build_name_result(search_by_name(keyword), keyword)
 
-    # ค้นหาสถานที่
-    if re.match(r'^(สถานที่|จุดจับ|ที่จับ)\s', t):
-        keyword = re.sub(r'^(สถานที่|จุดจับ|ที่จับ)\s+', '', t).strip()
+    # ── ค้นหาสถานที่ (มี prefix: สถานที่ / จุดจับ / ที่จับ) ──
+    if re.match(r'^(สถานที่|จุดจับ|ที่จับ)', t):
+        keyword = re.sub(r'^(สถานที่|จุดจับ|ที่จับ)\s*', '', t).strip()
         if not keyword:
-            return [TextMessage(text="กรุณาระบุสถานที่ เช่น: สถานที่ รามอินทรา")]
+            return [TextMessage(text="กรุณาระบุสถานที่ เช่น: สถานที่ ชุมชนวิมานสุข")]
         return build_location_result(search_by_location(keyword), keyword)
 
-    # สรุปเดือน
+    # ── ค้นหาสถานที่ (ไม่มี prefix — ขึ้นต้นด้วย ชุมชน/ซอย/ถ. ฯลฯ) ──
+    if LOCATION_PREFIX_RE.match(t):
+        return build_location_result(search_by_location(t), t)
+
+    # ── สรุปเดือน (มี prefix: เดือน / สรุปเดือน) ──
     if re.match(r'^(สรุปเดือน|เดือน)\s', t):
         arg = re.sub(r'^(สรุปเดือน|เดือน)\s+', '', t).strip()
         month_num, year_be = parse_month_year(arg)
@@ -711,7 +834,14 @@ def handle_message(text: str) -> list:
             return [TextMessage(text="กรุณาระบุเดือนและปี\nเช่น: เดือน ม.ค. 63")]
         return build_month_result(summary_by_month(month_num, year_be), month_num, year_be)
 
-    # สรุปปี
+    # ── สรุปเดือน (ไม่มี prefix — พิมพ์ตรงๆ เช่น มิ.ย.69 / มกราคม 69) ──
+    direct_month, direct_year = _is_direct_month_year(t)
+    if direct_month and direct_year:
+        return build_month_result(
+            summary_by_month(direct_month, direct_year), direct_month, direct_year
+        )
+
+    # ── สรุปปี ──
     if re.match(r'^(สรุปปี|ปี)\s', t):
         arg = re.sub(r'^(สรุปปี|ปี)\s+', '', t).strip()
         year_be = parse_year_only(arg)
@@ -720,27 +850,27 @@ def handle_message(text: str) -> list:
         rows, total = summary_by_year(year_be)
         return build_year_result(rows, total, year_be)
 
-    # ของกลาง
+    # ── ของกลาง ──
     if t.startswith('ของกลาง'):
         keyword = re.sub(r'^ของกลาง\s*', '', t).strip()
         return build_evidence_result(search_evidence(keyword), keyword)
 
-    # ข้อหา
+    # ── ข้อหา ──
     if t.startswith('ข้อหา'):
         keyword = re.sub(r'^ข้อหา\s*', '', t).strip()
         if not keyword:
             return [TextMessage(text="กรุณาระบุข้อหา เช่น: ข้อหา เสพยาบ้า")]
         return build_charge_result(search_by_charge(keyword), keyword)
 
-    # สถิติ
-    if any(k in t for k in ['สถิติ', 'ภาพรวม', 'รวมทั้งหมด', 'รายงาน']):
-        return build_stats()
-
-    # Default: ลองค้นชื่ออัตโนมัติ
+    # ── Default: ลองค้นชื่อ → ถ้าไม่เจอ ลองค้นสถานที่ ──
     if len(t) >= 2:
-        rows = search_by_name(t)
-        if rows:
-            return build_name_result(rows, t)
+        name_rows = search_by_name(t)
+        if name_rows:
+            return build_name_result(name_rows, t)
+        # ลองค้นสถานที่อัตโนมัติ
+        loc_rows = search_by_location(t)
+        if loc_rows:
+            return build_location_result(loc_rows, t)
 
     return [TextMessage(
         text=f"❓ ไม่เข้าใจคำสั่ง '{t}'\n\nพิมพ์ ช่วยเหลือ หรือ help เพื่อดูคำสั่งทั้งหมด"
