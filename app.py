@@ -62,63 +62,62 @@ def get_conn():
     return conn
 
 
-def search_by_name(keyword: str, limit=25):
+DETAIL_LIMIT = 30  # จำนวนรายการที่แสดงในรายละเอียด (ล่าสุดก่อน)
+
+
+def search_by_name(keyword: str):
     conn = get_conn()
+    total = conn.execute(
+        "SELECT COUNT(*) FROM arrests WHERE name LIKE ?",
+        (f"%{keyword}%",)
+    ).fetchone()[0]
     rows = conn.execute(
         """SELECT * FROM arrests
            WHERE name LIKE ?
-           ORDER BY year_be, month_num, date_str
+           ORDER BY year_be DESC, month_num DESC, date_str DESC
            LIMIT ?""",
-        (f"%{keyword}%", limit)
+        (f"%{keyword}%", DETAIL_LIMIT)
     ).fetchall()
     conn.close()
-    return rows
+    return rows, total
 
 
-def search_by_location(keyword: str, limit=50):
-    """ค้นหาสถานที่ — ค้น exact แล้ว fallback แบบ token-split"""
-    conn = get_conn()
-
-    # รอบ 1: ค้น full keyword
+def _loc_query(conn, like_kw: str):
+    """query ทั้ง total และ rows ล่าสุด 30 ราย สำหรับ location"""
+    total = conn.execute(
+        "SELECT COUNT(*) FROM arrests WHERE location LIKE ? AND location != ''",
+        (like_kw,)
+    ).fetchone()[0]
     rows = conn.execute(
         """SELECT name, date_str, charge, evidence, location, year_be, month_num
            FROM arrests
            WHERE location LIKE ? AND location != ''
-           ORDER BY year_be, month_num, date_str
+           ORDER BY year_be DESC, month_num DESC, date_str DESC
            LIMIT ?""",
-        (f"%{keyword}%", limit)
+        (like_kw, DETAIL_LIMIT)
     ).fetchall()
+    return rows, total
 
-    # รอบ 2: ถ้าไม่เจอ → ลองตัดคำ prefix ออก แล้วค้นส่วนหลัก
-    # เช่น "ชุมชนสุเหล่าแดง" → ค้น "สุเหล่า" หรือ "แดง" ทีละส่วน
+
+def search_by_location(keyword: str):
+    """ค้นหาสถานที่ — ค้น exact แล้ว fallback แบบ token-split, คืน (rows, total)"""
+    conn = get_conn()
+
+    # รอบ 1: exact keyword
+    rows, total = _loc_query(conn, f"%{keyword}%")
+
+    # รอบ 2: ตัด prefix (ชุมชน/ซอย/ถ. ฯลฯ)
     if not rows and len(keyword) >= 3:
-        # ตัดคำนำหน้าที่รู้จัก
         stripped = re.sub(r'^(ชุมชน|ซอย|ถ\.|ถนน|หมู่บ้าน|สน\.|ริม|แยก)\s*', '', keyword).strip()
         if stripped and stripped != keyword:
-            rows = conn.execute(
-                """SELECT name, date_str, charge, evidence, location, year_be, month_num
-                   FROM arrests
-                   WHERE location LIKE ? AND location != ''
-                   ORDER BY year_be, month_num, date_str
-                   LIMIT ?""",
-                (f"%{stripped}%", limit)
-            ).fetchall()
+            rows, total = _loc_query(conn, f"%{stripped}%")
 
-    # รอบ 3: ยังไม่เจอ → ค้นจากส่วนท้ายของคำ (เช่น "แดง" จาก "สุเหล่าแดง")
+    # รอบ 3: suffix 3 ตัวท้าย
     if not rows and len(keyword) >= 3:
-        # เอา 3 ตัวท้าย
-        suffix = keyword[-3:]
-        rows = conn.execute(
-            """SELECT name, date_str, charge, evidence, location, year_be, month_num
-               FROM arrests
-               WHERE location LIKE ? AND location != ''
-               ORDER BY year_be, month_num, date_str
-               LIMIT ?""",
-            (f"%{suffix}%", limit)
-        ).fetchall()
+        rows, total = _loc_query(conn, f"%{keyword[-3:]}%")
 
     conn.close()
-    return rows
+    return rows, total
 
 
 def summary_by_month(month_num: int, year_be: int):
@@ -165,17 +164,21 @@ def search_evidence(keyword: str, limit=30):
     return rows
 
 
-def search_by_charge(keyword: str, limit=30):
+def search_by_charge(keyword: str):
     conn = get_conn()
+    total = conn.execute(
+        "SELECT COUNT(*) FROM arrests WHERE charge LIKE ?",
+        (f"%{keyword}%",)
+    ).fetchone()[0]
     rows = conn.execute(
         """SELECT * FROM arrests
            WHERE charge LIKE ?
-           ORDER BY year_be, month_num
+           ORDER BY year_be DESC, month_num DESC, date_str DESC
            LIMIT ?""",
-        (f"%{keyword}%", limit)
+        (f"%{keyword}%", DETAIL_LIMIT)
     ).fetchall()
     conn.close()
-    return rows
+    return rows, total
 
 
 def get_overall_stats():
@@ -311,26 +314,25 @@ def build_not_found(msg: str) -> list:
     return [flex("ไม่พบข้อมูล", bubble)]
 
 
-def build_name_result(rows, keyword: str) -> list:
-    """ค้นหาบุคคล: Flex summary + Text รายละเอียด"""
+def build_name_result(rows, total: int, keyword: str) -> list:
+    """ค้นหาบุคคล: Flex summary (ยอดจริง) + Text รายละเอียด 30 ล่าสุด"""
     if not rows:
         return build_not_found(f"ไม่พบบุคคลที่ชื่อ '{keyword}'")
 
-    # Group by name
+    # Group by name จาก rows ที่แสดง (30 ล่าสุด)
     by_name: dict = {}
     for r in rows:
-        n = r['name']
-        by_name.setdefault(n, []).append(r)
+        by_name.setdefault(r['name'], []).append(r)
 
-    total_persons = len(by_name)
-    total_records = len(rows)
+    shown = len(rows)
 
     # ── Flex summary card ──
     body = [
         _row("คำค้นหา", keyword),
-        _row("จำนวนบุคคล", f"{total_persons} คน"),
-        _row("จำนวนครั้งที่จับ", f"{total_records} ครั้ง"),
+        _row("จำนวนครั้งที่จับ (ยอดจริง)", f"{total} ครั้ง"),
+        _row("จำนวนบุคคล (ยอดจริง)", f"≥ {len(by_name)} คน"),
         _sep(),
+        _text(f"📋 แสดง {shown} รายการล่าสุด:", weight="bold", size="sm"),
     ]
     for name, recs in by_name.items():
         body.append({
@@ -343,18 +345,24 @@ def build_name_result(rows, keyword: str) -> list:
             ]
         })
 
-    if total_records >= 25:
+    if total > DETAIL_LIMIT:
         body.append(_sep())
-        body.append(_text("⚠️ แสดงสูงสุด 25 รายการ กรุณาระบุชื่อให้ชัดเจนขึ้น",
-                          size="xs", color=CLR_GRAY))
+        body.append(_text(
+            f"⚠️ แสดง {DETAIL_LIMIT} รายการล่าสุด จากทั้งหมด {total} รายการ\n"
+            "กรุณาระบุชื่อให้ชัดเจนขึ้นเพื่อดูครบทุกรายการ",
+            size="xs", color=CLR_GRAY
+        ))
 
     bubble = _bubble(f"🔍 ค้นหา: {keyword}", CLR_HEADER_BLUE, body)
-    messages = [flex(f"ค้นหา {keyword}: พบ {total_persons} คน", bubble)]
+    messages = [flex(f"ค้นหา {keyword}: พบ {total} ครั้ง", bubble)]
 
-    # ── Text รายละเอียดแต่ละคน ──
-    detail_lines = []
+    # ── Text รายละเอียด (30 ล่าสุด เรียงจากปัจจุบัน) ──
+    header = f"📋 รายละเอียด {shown} รายการล่าสุด"
+    if total > DETAIL_LIMIT:
+        header += f" (จากทั้งหมด {total} รายการ)"
+    detail_lines = [header + "\n"]
     for name, recs in by_name.items():
-        detail_lines.append(f"👤 {name}  ({len(recs)} ครั้ง)")
+        detail_lines.append(f"👤 {name}  ({len(recs)} ครั้ง ในชุดนี้)")
         for i, rec in enumerate(recs, 1):
             date   = rec['date_str'] or '-'
             charge = rec['charge'] or '-'
@@ -369,7 +377,6 @@ def build_name_result(rows, keyword: str) -> list:
         detail_lines.append("")
 
     detail_text = "\n".join(detail_lines).strip()
-    # แบ่งข้อความถ้ายาวเกิน 4900 ตัวอักษร
     while detail_text:
         chunk = detail_text[:4900]
         detail_text = detail_text[4900:]
@@ -380,20 +387,18 @@ def build_name_result(rows, keyword: str) -> list:
     return messages
 
 
-def build_location_result(rows, keyword: str) -> list:
-    """ค้นหาสถานที่: Flex summary + Text รายชื่อ"""
+def build_location_result(rows, total: int, keyword: str) -> list:
+    """ค้นหาสถานที่: Flex summary (ยอดจริง) + Text รายชื่อ 30 ล่าสุด"""
     if not rows:
         return build_not_found(
             f"ไม่พบข้อมูลสถานที่ '{keyword}'\n"
             "หมายเหตุ: ข้อมูลสถานที่มีเฉพาะปี 2558 เป็นต้นไป"
         )
 
-    total = len(rows)
-    # นับจำนวนชื่อไม่ซ้ำ
+    shown = len(rows)
     unique_names = list(dict.fromkeys(r['name'] for r in rows))
-    total_persons = len(unique_names)
 
-    # นับข้อหา
+    # นับข้อหาจาก rows ที่แสดง (ใช้ข้อมูล total จริงสำหรับ summary)
     charge_count: dict = {}
     for r in rows:
         c = r['charge'] or 'ไม่ระบุ'
@@ -403,23 +408,29 @@ def build_location_result(rows, keyword: str) -> list:
     # ── Flex summary card ──
     body = [
         _row("สถานที่", keyword),
-        _row("จำนวนครั้งที่จับ", f"{total} ครั้ง"),
-        _row("จำนวนผู้ต้องหา", f"{total_persons} คน"),
+        _row("จำนวนครั้งที่จับ (ยอดจริง)", f"{total} ครั้ง"),
+        _row("จำนวนผู้ต้องหา (ยอดจริง)", f"≥ {len(unique_names)} คน"),
         _sep(),
-        _text("📋 ข้อหาที่พบ:", weight="bold", size="sm"),
+        _text(f"📋 ข้อหาที่พบ (จาก {shown} ล่าสุด):", weight="bold", size="sm"),
     ]
     for c, cnt in top_charges:
         body.append(_row(f"  • {c}", f"{cnt} ราย"))
 
-    if total >= 50:
+    if total > DETAIL_LIMIT:
         body.append(_sep())
-        body.append(_text("⚠️ แสดงสูงสุด 50 รายการ", size="xs", color=CLR_GRAY))
+        body.append(_text(
+            f"⚠️ แสดง {DETAIL_LIMIT} รายการล่าสุด จากทั้งหมด {total} รายการ",
+            size="xs", color=CLR_GRAY
+        ))
 
     bubble = _bubble(f"📍 สถานที่: {keyword}", CLR_HEADER_GREEN, body)
     messages = [flex(f"สถานที่ {keyword}: พบ {total} ครั้ง", bubble)]
 
-    # ── Text รายชื่อผู้ถูกจับ ──
-    lines = [f"📍 รายชื่อผู้ถูกจับที่ {keyword}\n"]
+    # ── Text รายชื่อ 30 ล่าสุด ──
+    header = f"📍 รายชื่อ {shown} รายการล่าสุด ที่ {keyword}"
+    if total > DETAIL_LIMIT:
+        header += f"\n(ทั้งหมด {total} รายการ — แสดง {DETAIL_LIMIT} ล่าสุด)"
+    lines = [header + "\n"]
     for i, r in enumerate(rows, 1):
         name   = r['name']
         date   = r['date_str'] or '-'
@@ -626,13 +637,12 @@ def build_evidence_result(rows, keyword: str) -> list:
     return [flex(f"ของกลาง {keyword}: {total_cases} ครั้ง", bubble)]
 
 
-def build_charge_result(rows, keyword: str) -> list:
-    """ข้อหา"""
+def build_charge_result(rows, total: int, keyword: str) -> list:
+    """ข้อหา: ยอดจริง + รายละเอียด 30 ล่าสุด"""
     if not rows:
         return build_not_found(f"ไม่พบข้อหาที่มีคำว่า '{keyword}'")
 
-    total = len(rows)
-    # นับจำนวนข้อหาย่อย
+    shown = len(rows)
     charge_count: dict = {}
     for r in rows:
         c = r['charge'] or 'ไม่ระบุ'
@@ -640,22 +650,28 @@ def build_charge_result(rows, keyword: str) -> list:
 
     body = [
         _row("คำค้นหา", keyword),
-        _row("จำนวนผู้ต้องหา", f"{total} ราย"),
+        _row("จำนวนผู้ต้องหา (ยอดจริง)", f"{total} ราย"),
         _sep(),
-        _text("📋 ข้อหาที่ตรงกัน:", weight="bold", size="sm"),
+        _text(f"📋 ข้อหาย่อย (จาก {shown} ล่าสุด):", weight="bold", size="sm"),
     ]
     for c, cnt in sorted(charge_count.items(), key=lambda x: -x[1])[:8]:
         body.append(_row(f"  • {c}", f"{cnt} ราย"))
 
-    if total >= 30:
+    if total > DETAIL_LIMIT:
         body.append(_sep())
-        body.append(_text("⚠️ แสดงสูงสุด 30 รายการ", size="xs", color=CLR_GRAY))
+        body.append(_text(
+            f"⚠️ แสดง {DETAIL_LIMIT} รายการล่าสุด จากทั้งหมด {total} รายการ",
+            size="xs", color=CLR_GRAY
+        ))
 
     bubble = _bubble(f"📋 ข้อหา: {keyword}", CLR_HEADER_ORANGE, body)
     messages = [flex(f"ข้อหา {keyword}: {total} ราย", bubble)]
 
-    # Text รายชื่อ
-    lines = [f"📋 รายชื่อผู้ต้องหาข้อหา '{keyword}' ({total} ราย)\n"]
+    # Text รายชื่อ 30 ล่าสุด
+    header = f"📋 รายชื่อข้อหา '{keyword}' — {shown} รายการล่าสุด"
+    if total > DETAIL_LIMIT:
+        header += f" (ทั้งหมด {total} ราย)"
+    lines = [header + "\n"]
     for i, r in enumerate(rows, 1):
         date = r['date_str'] or '-'
         name = r['name']
@@ -817,18 +833,21 @@ def handle_message(text: str) -> list:
         keyword = re.sub(r'^(ค้นหา|หา)\s+', '', t).strip()
         if not keyword:
             return [TextMessage(text="กรุณาระบุชื่อ เช่น: ค้นหา สมชาย")]
-        return build_name_result(search_by_name(keyword), keyword)
+        rows, total = search_by_name(keyword)
+        return build_name_result(rows, total, keyword)
 
     # ── ค้นหาสถานที่ (มี prefix: สถานที่ / จุดจับ / ที่จับ) ──
     if re.match(r'^(สถานที่|จุดจับ|ที่จับ)', t):
         keyword = re.sub(r'^(สถานที่|จุดจับ|ที่จับ)\s*', '', t).strip()
         if not keyword:
             return [TextMessage(text="กรุณาระบุสถานที่ เช่น: สถานที่ ชุมชนวิมานสุข")]
-        return build_location_result(search_by_location(keyword), keyword)
+        rows, total = search_by_location(keyword)
+        return build_location_result(rows, total, keyword)
 
     # ── ค้นหาสถานที่ (ไม่มี prefix — ขึ้นต้นด้วย ชุมชน/ซอย/ถ. ฯลฯ) ──
     if LOCATION_PREFIX_RE.match(t):
-        return build_location_result(search_by_location(t), t)
+        rows, total = search_by_location(t)
+        return build_location_result(rows, total, t)
 
     # ── สรุปเดือน (มี prefix: เดือน / สรุปเดือน) ──
     if re.match(r'^(สรุปเดือน|เดือน)\s', t):
@@ -864,17 +883,17 @@ def handle_message(text: str) -> list:
         keyword = re.sub(r'^ข้อหา\s*', '', t).strip()
         if not keyword:
             return [TextMessage(text="กรุณาระบุข้อหา เช่น: ข้อหา เสพยาบ้า")]
-        return build_charge_result(search_by_charge(keyword), keyword)
+        rows, total = search_by_charge(keyword)
+        return build_charge_result(rows, total, keyword)
 
     # ── Default: ลองค้นชื่อ → ถ้าไม่เจอ ลองค้นสถานที่ ──
     if len(t) >= 2:
-        name_rows = search_by_name(t)
+        name_rows, name_total = search_by_name(t)
         if name_rows:
-            return build_name_result(name_rows, t)
-        # ลองค้นสถานที่อัตโนมัติ
-        loc_rows = search_by_location(t)
+            return build_name_result(name_rows, name_total, t)
+        loc_rows, loc_total = search_by_location(t)
         if loc_rows:
-            return build_location_result(loc_rows, t)
+            return build_location_result(loc_rows, loc_total, t)
 
     return [TextMessage(
         text=f"❓ ไม่เข้าใจคำสั่ง '{t}'\n\nพิมพ์ ช่วยเหลือ หรือ help เพื่อดูคำสั่งทั้งหมด"
