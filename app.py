@@ -14,18 +14,27 @@ import os
 import re
 import json
 import sqlite3
+import logging
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
-    ReplyMessageRequest, TextMessage, FlexMessage, FlexContainer
+    ReplyMessageRequest, PushMessageRequest,
+    TextMessage, FlexMessage, FlexContainer
 )
 from linebot.v3.webhooks import (
     MessageEvent, TextMessageContent,
     JoinEvent, MemberJoinedEvent, FollowEvent,
     LeaveEvent, UnfollowEvent,
 )
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+log = logging.getLogger(__name__)
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 LINE_CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET", "YOUR_CHANNEL_SECRET")
@@ -915,6 +924,9 @@ WELCOME_TEXT = (
 
 def _reply(reply_token: str, messages: list):
     """ส่ง reply พร้อม error handling"""
+    if not reply_token:
+        log.warning("[reply] reply_token is empty, skip")
+        return
     try:
         with ApiClient(configuration) as api_client:
             MessagingApi(api_client).reply_message(
@@ -924,57 +936,93 @@ def _reply(reply_token: str, messages: list):
                 )
             )
     except Exception as e:
-        print(f"[reply error] {e}")
+        log.error(f"[reply error] {e}")
+
+
+def _push(to: str, messages: list):
+    """ส่ง push message (ไม่ต้องใช้ reply_token)"""
+    if not to:
+        return
+    try:
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).push_message(
+                PushMessageRequest(to=to, messages=messages[:5])
+            )
+    except Exception as e:
+        log.error(f"[push error] {e}")
 
 
 @app.route("/callback", methods=['POST'])
 def callback():
+    """
+    Webhook endpoint — ต้องคืน 200 OK เสมอ
+    ถ้าคืน 4xx/5xx LINE จะ retry และอาจนำ Bot ออกจากกลุ่ม
+    """
     signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
+    log.info(f"[webhook] body={body[:120]}")
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
+        log.error("[webhook] Invalid signature")
         abort(400)
     except Exception as e:
-        # จับ exception ทุกชนิด ไม่ให้คืน 500 ซึ่งจะทำให้ LINE นำ Bot ออกจากกลุ่ม
-        print(f"[webhook error] {e}")
-    return 'OK'
+        log.error(f"[webhook] Unhandled error: {e}", exc_info=True)
+    return 'OK', 200   # ← คืน 200 เสมอ แม้จะมี error
 
 
 # ── Bot เข้าร่วมกลุ่ม / ห้อง ──────────────────────────────────────────────────
 @handler.add(JoinEvent)
 def handle_join(event: JoinEvent):
-    """รับเหตุการณ์เมื่อ Bot ถูกเชิญเข้ากลุ่ม — ส่งข้อความต้อนรับ"""
-    _reply(event.reply_token, [TextMessage(text=WELCOME_TEXT)])
+    """
+    รับเหตุการณ์เมื่อ Bot ถูกเชิญเข้ากลุ่ม
+    ใช้ reply_token ถ้ามี ไม่งั้น push
+    """
+    source = event.source
+    log.info(f"[JoinEvent] type={source.type} id={getattr(source, 'group_id', None) or getattr(source, 'room_id', None)}")
+    try:
+        if event.reply_token and event.reply_token != '00000000000000000000000000000000':
+            _reply(event.reply_token, [TextMessage(text=WELCOME_TEXT)])
+        else:
+            # fallback: push ไปที่กลุ่ม
+            group_id = getattr(source, 'group_id', None) or getattr(source, 'room_id', None)
+            if group_id:
+                _push(group_id, [TextMessage(text=WELCOME_TEXT)])
+    except Exception as e:
+        log.error(f"[JoinEvent] error: {e}", exc_info=True)
 
 
 # ── มีสมาชิกใหม่เข้ากลุ่ม ─────────────────────────────────────────────────────
 @handler.add(MemberJoinedEvent)
 def handle_member_joined(event: MemberJoinedEvent):
-    """รับรู้ว่ามีสมาชิกเข้ากลุ่ม แต่ไม่ตอบ (ป้องกัน exception)"""
-    pass
+    log.info("[MemberJoinedEvent] received")
 
 
 # ── ผู้ใช้ Add Bot เป็นเพื่อน ──────────────────────────────────────────────────
 @handler.add(FollowEvent)
 def handle_follow(event: FollowEvent):
-    """แชทส่วนตัว: ส่งข้อความต้อนรับ"""
-    welcome = WELCOME_TEXT.replace("bot ", "").replace(
-        "💡 พิมพ์  bot help  เพื่อดูคำสั่งทั้งหมด",
-        "💡 พิมพ์  help  เพื่อดูคำสั่งทั้งหมด"
+    log.info(f"[FollowEvent] user_id={event.source.user_id}")
+    welcome = (
+        "🚔 สวัสดีครับ! บอทสืบค้นการจับกุม สน.บางชัน พร้อมให้บริการ\n\n"
+        "💡 พิมพ์  help  เพื่อดูคำสั่งทั้งหมด\n"
+        "ตัวอย่าง:\n"
+        "  ค้นหา สมชาย\n"
+        "  ชุมชนวิมานสุข\n"
+        "  มิ.ย.69\n"
+        "  สถิติ"
     )
     _reply(event.reply_token, [TextMessage(text=welcome)])
 
 
-# ── Bot ออกจากกลุ่ม / Unfollow (log เท่านั้น) ────────────────────────────────
+# ── Bot ออกจากกลุ่ม / Unfollow ───────────────────────────────────────────────
 @handler.add(LeaveEvent)
 def handle_leave(event: LeaveEvent):
-    print("[LeaveEvent] Bot was removed from a group/room")
+    log.warning(f"[LeaveEvent] Bot was removed — source={event.source.type}")
 
 
 @handler.add(UnfollowEvent)
 def handle_unfollow(event: UnfollowEvent):
-    print("[UnfollowEvent] User unfollowed the bot")
+    log.info(f"[UnfollowEvent] user_id={event.source.user_id}")
 
 
 # ── รับข้อความ ────────────────────────────────────────────────────────────────
@@ -982,13 +1030,13 @@ def handle_unfollow(event: UnfollowEvent):
 def handle_text_message(event: MessageEvent):
     try:
         user_text = event.message.text.strip()
+        source_type = event.source.type   # 'user' | 'group' | 'room'
+        log.info(f"[msg] source={source_type} text={user_text[:60]}")
 
-        # ── กลุ่ม / ห้อง: ต้องพิมพ์ "bot " นำหน้า ──
-        source_type = event.source.type  # 'user' | 'group' | 'room'
+        # ── กลุ่ม / ห้อง: ต้องพิมพ์ "bot" นำหน้า ──
         if source_type in ('group', 'room'):
             if not re.match(r'^bot\b', user_text, re.IGNORECASE):
-                return  # เงียบ ไม่ตอบ
-            # ตัด "bot" และ space ออก แล้วส่งต่อ
+                return   # เงียบ ไม่ตอบ
             user_text = re.sub(r'^bot\s*', '', user_text, flags=re.IGNORECASE).strip()
             if not user_text:
                 _reply(event.reply_token, [TextMessage(text=WELCOME_TEXT)])
@@ -998,11 +1046,10 @@ def handle_text_message(event: MessageEvent):
         _reply(event.reply_token, messages)
 
     except Exception as e:
-        print(f"[handle_text_message error] {e}")
+        log.error(f"[handle_text_message] {e}", exc_info=True)
         try:
-            _reply(event.reply_token, [
-                TextMessage(text="❌ เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง")
-            ])
+            _reply(event.reply_token,
+                   [TextMessage(text="❌ เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง")])
         except Exception:
             pass
 
