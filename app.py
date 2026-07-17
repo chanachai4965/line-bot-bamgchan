@@ -922,11 +922,10 @@ WELCOME_TEXT = (
 )
 
 
-def _reply(reply_token: str, messages: list):
-    """ส่ง reply พร้อม error handling"""
-    if not reply_token:
-        log.warning("[reply] reply_token is empty, skip")
-        return
+def _reply(reply_token: str, messages: list) -> bool:
+    """ส่ง reply — คืน True ถ้าสำเร็จ"""
+    if not reply_token or reply_token == '00000000000000000000000000000000':
+        return False
     try:
         with ApiClient(configuration) as api_client:
             MessagingApi(api_client).reply_message(
@@ -935,8 +934,10 @@ def _reply(reply_token: str, messages: list):
                     messages=messages[:5]
                 )
             )
+        return True
     except Exception as e:
         log.error(f"[reply error] {e}")
+        return False
 
 
 def _push(to: str, messages: list):
@@ -1033,6 +1034,14 @@ def handle_text_message(event: MessageEvent):
         source_type = event.source.type   # 'user' | 'group' | 'room'
         log.info(f"[msg] source={source_type} text={user_text[:60]}")
 
+        # ดึง ID ของผู้ส่ง / กลุ่ม เพื่อใช้ push เป็น fallback
+        source = event.source
+        push_to = (
+            getattr(source, 'group_id', None)
+            or getattr(source, 'room_id', None)
+            or getattr(source, 'user_id', None)
+        )
+
         # ── กลุ่ม / ห้อง: ต้องพิมพ์ "bot" นำหน้า ──
         if source_type in ('group', 'room'):
             if not re.match(r'^bot\b', user_text, re.IGNORECASE):
@@ -1042,14 +1051,25 @@ def handle_text_message(event: MessageEvent):
                 _reply(event.reply_token, [TextMessage(text=WELCOME_TEXT)])
                 return
 
-        messages = handle_message(user_text)
-        _reply(event.reply_token, messages)
+        out_messages = handle_message(user_text)
+
+        # ลอง reply ก่อน ถ้า token หมดอายุ (Render หลับ) ให้ push แทน
+        sent = _reply(event.reply_token, out_messages)
+        if not sent and push_to:
+            log.warning(f"[msg] reply failed → push to {push_to}")
+            _push(push_to, out_messages)
 
     except Exception as e:
         log.error(f"[handle_text_message] {e}", exc_info=True)
         try:
-            _reply(event.reply_token,
-                   [TextMessage(text="❌ เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง")])
+            push_to = (
+                getattr(event.source, 'group_id', None)
+                or getattr(event.source, 'room_id', None)
+                or getattr(event.source, 'user_id', None)
+            )
+            err_msg = [TextMessage(text="❌ เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง")]
+            if not _reply(event.reply_token, err_msg) and push_to:
+                _push(push_to, err_msg)
         except Exception:
             pass
 
@@ -1059,12 +1079,18 @@ def health():
     conn = get_conn()
     total = conn.execute("SELECT COUNT(*) FROM arrests").fetchone()[0]
     conn.close()
-    return {"status": "ok", "total_records": total, "version": "2.0"}
+    return {"status": "ok", "total_records": total, "version": "2.1"}
+
+
+@app.route("/ping", methods=['GET'])
+def ping():
+    """Keep-alive endpoint — ให้ cron service ping ทุก 10 นาที ป้องกัน Render หลับ"""
+    return "pong", 200
 
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
-    print(f"🚀 LINE Bot v2.0 กำลังทำงานที่ port {port}")
+    print(f"🚀 LINE Bot v2.1 กำลังทำงานที่ port {port}")
     print(f"📂 ฐานข้อมูล: {DB_PATH}")
     print(f"💡 กลุ่ม LINE: พิมพ์ 'bot [คำสั่ง]' เพื่อเรียกใช้งาน")
     app.run(host='0.0.0.0', port=port, debug=False)
