@@ -7,8 +7,9 @@
  * ค่า key ต้องตรงกับ APPS_SCRIPT_KEY ใน LINE Bot (Render)
  */
 
-const SECRET_KEY  = 'bangchan-secret-2026';   // ← ต้องตรงกับ APPS_SCRIPT_KEY
-const SKIP_SHEETS = ['555', 'ตารางเปล่า', 'สรุป', 'หมายจับ', 'Sheet1'];
+const SECRET_KEY     = 'bangchan-secret-2026';            // ← ต้องตรงกับ APPS_SCRIPT_KEY
+const SPREADSHEET_ID = '1DKdVKQCBcEcm9dYbLFPHu_Fzxr1fbvyi_4q3DR8n-gg'; // ← Google Sheet ID
+const SKIP_SHEETS    = ['555', 'ตารางเปล่า', 'สรุป', 'หมายจับ', 'Sheet1'];
 
 /* คอลัมน์รูปแบบใหม่ (ก.ค.69+) */
 const NEW_COL = {
@@ -53,16 +54,21 @@ function json(obj) {
 
 // ─── Fetch all sheets ─────────────────────────────────────────────────────────
 function getAllRecords() {
-  const ss      = SpreadsheetApp.getActiveSpreadsheet();
+  // ใช้ openById() แทน getActiveSpreadsheet()
+  // เพื่อให้ทำงานได้ทั้ง standalone project และ bound project
+  const ss      = SpreadsheetApp.openById(SPREADSHEET_ID);
   const sheets  = ss.getSheets();
   const records = [];
   let   sheetsProcessed = 0;
+  const skipped = [];
 
   for (const ws of sheets) {
     const name = ws.getName().trim();
     // ข้ามชีทที่ไม่ใช่ข้อมูล
-    if (SKIP_SHEETS.some(s => name.includes(s))) continue;
-    // ข้ามชีทที่ชื่อไม่มีเดือน (เช่น ชีทสรุป, ชีทหมายจับ)
+    if (SKIP_SHEETS.some(s => name.includes(s))) {
+      skipped.push(name);
+      continue;
+    }
     const recs = parseSheet(ws, name);
     records.push(...recs);
     sheetsProcessed++;
@@ -71,7 +77,9 @@ function getAllRecords() {
   return {
     records:         records,
     total:           records.length,
-    sheetsProcessed: sheetsProcessed
+    sheetsProcessed: sheetsProcessed,
+    totalSheets:     sheets.length,
+    skipped:         skipped.length
   };
 }
 
