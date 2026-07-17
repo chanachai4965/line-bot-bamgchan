@@ -57,24 +57,42 @@ def fetch_all() -> list:
     """เรียก Apps Script Web App → คืน list ของ record dict (snake_case)"""
     try:
         params = {'key': APPS_SCRIPT_KEY} if APPS_SCRIPT_KEY else {}
-        log.info(f'[fetch] calling Apps Script: {APPS_SCRIPT_URL}')
-        resp = requests.get(APPS_SCRIPT_URL, params=params, timeout=FETCH_TIMEOUT, allow_redirects=True)
+        log.info(f'[fetch] GET {APPS_SCRIPT_URL} key={bool(APPS_SCRIPT_KEY)}')
+        resp = requests.get(
+            APPS_SCRIPT_URL, params=params,
+            timeout=FETCH_TIMEOUT, allow_redirects=True
+        )
+        log.info(f'[fetch] HTTP {resp.status_code} url={resp.url[:80]}')
+
+        # ตรวจสอบว่า response เป็น JSON จริง ไม่ใช่ HTML error page
+        ct = resp.headers.get('Content-Type', '')
+        if 'html' in ct:
+            log.error(f'[fetch] got HTML instead of JSON — Apps Script may need authorization')
+            log.error(f'[fetch] first 300 chars: {resp.text[:300]}')
+            return _cache_data
+
         resp.raise_for_status()
         payload = resp.json()
 
         if 'error' in payload:
-            log.error(f'[fetch] Apps Script error: {payload["error"]}')
+            err = payload['error']
+            log.error(f'[fetch] Apps Script returned error: {err}')
+            if err == 'Unauthorized':
+                log.error(f'[fetch] ❌ KEY ไม่ตรง — ตรวจสอบ APPS_SCRIPT_KEY และ SECRET_KEY ใน Code.gs')
             return _cache_data
 
         raw_records: list = payload.get('records', [])
-        # แปลง camelCase → snake_case ให้ code ที่เหลือใช้เหมือนเดิม
         records = [_normalise(r) for r in raw_records]
-        log.info(f'[fetch] loaded {len(records)} records')
+        log.info(f'[fetch] ✅ loaded {len(records)} records '
+                 f'(sheets={payload.get("sheetsProcessed","?")})')
         return records
 
+    except requests.exceptions.Timeout:
+        log.error(f'[fetch] ⏱ timeout after {FETCH_TIMEOUT}s — Apps Script ใช้เวลานานเกินไป')
+        return _cache_data
     except Exception as e:
         log.error(f'[fetch] {e}', exc_info=True)
-        return _cache_data   # คืน stale cache เมื่อ error
+        return _cache_data
 
 
 def _normalise(r: dict) -> dict:
@@ -667,8 +685,50 @@ def index():
     return f'LINE Bot สน.บางชัน v4 | {n} records | cache age {age}s', 200
 
 
-# ─── Startup ──────────────────────────────────────────────────────────────────
+@app.route('/debug')
+def debug():
+    """ทดสอบการเชื่อมต่อ Apps Script และแสดง raw response"""
+    import json as _json
+    try:
+        params = {'key': APPS_SCRIPT_KEY} if APPS_SCRIPT_KEY else {}
+        resp   = requests.get(
+            APPS_SCRIPT_URL, params=params,
+            timeout=FETCH_TIMEOUT, allow_redirects=True
+        )
+        ct      = resp.headers.get('Content-Type', '')
+        preview = resp.text[:500]
+        try:
+            payload  = resp.json()
+            n_rec    = len(payload.get('records', []))
+            sheets   = payload.get('sheetsProcessed', '?')
+            err_msg  = payload.get('error', None)
+            status   = f'OK — {n_rec} records, {sheets} sheets'
+            if err_msg:
+                status = f'ERROR: {err_msg}'
+        except Exception:
+            n_rec  = 0
+            status = 'JSON parse failed'
+
+        lines = [
+            f'=== Debug: Apps Script ===',
+            f'URL: {resp.url[:100]}',
+            f'HTTP: {resp.status_code}',
+            f'Content-Type: {ct}',
+            f'Apps Script status: {status}',
+            f'Cache: {len(_cache_data)} records, age {int(time.time()-_cache_ts) if _cache_ts else -1}s',
+            f'',
+            f'--- Response preview (first 500 chars) ---',
+            preview,
+        ]
+        return '\n'.join(lines), 200, {'Content-Type': 'text/plain; charset=utf-8'}
+    except Exception as e:
+        return f'debug error: {e}', 500
+
+
+# ─── Startup preload ──────────────────────────────────────────────────────────
+# ทำงานตอน gunicorn import module — ไม่ใช้ if __name__ เพราะ gunicorn ไม่รัน block นั้น
+threading.Thread(target=get_data, daemon=True).start()
+
 if __name__ == '__main__':
-    threading.Thread(target=get_data, daemon=True).start()
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)

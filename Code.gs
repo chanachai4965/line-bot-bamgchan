@@ -2,13 +2,12 @@
  * LINE Bot สน.บางชัน — Google Apps Script Data API
  * วิธีใช้: Deploy → New Deployment → Web App
  *          Execute as: Me, Who has access: Anyone
- * แล้วคัดลอก URL ไปใส่ใน APPS_SCRIPT_URL ของ LINE Bot
  *
- * ความปลอดภัย: เรียกได้เฉพาะคนที่รู้ SECRET_KEY เท่านั้น
- * ตั้งค่า key ให้ตรงกับ APPS_SCRIPT_KEY ใน LINE Bot
+ * ความปลอดภัย: ต้องส่ง ?key=SECRET_KEY มาด้วย
+ * ค่า key ต้องตรงกับ APPS_SCRIPT_KEY ใน LINE Bot (Render)
  */
 
-const SECRET_KEY  = 'bangchan-secret-2026';   // ← เปลี่ยนได้ตามต้องการ
+const SECRET_KEY  = 'bangchan-secret-2026';   // ← ต้องตรงกับ APPS_SCRIPT_KEY
 const SKIP_SHEETS = ['555', 'ตารางเปล่า', 'สรุป', 'หมายจับ', 'Sheet1'];
 
 /* คอลัมน์รูปแบบใหม่ (ก.ค.69+) */
@@ -27,28 +26,29 @@ const MONTH_MAP = {
   'ก.ค.':7,'ส.ค.':8,'ก.ย.':9,'ต.ค.':10,'พ.ย.':11,'ธ.ค.':12
 };
 
+const MONTH_ABBR_LIST = ['','ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.',
+                         'ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
+
 const SHEET_MONTH_RE = /(ม\.ค\.|ก\.พ\.|มี\.ค\.|เม\.ย\.|พ\.ค\.|มิ\.ย\.|ก\.ค\.|ส\.ค\.|ก\.ย\.|ต\.ค\.|พ\.ย\.|ธ\.ค\.)\.?\s*(\d{2})/;
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 function doGet(e) {
   try {
     // ตรวจสอบ secret key
-    const key = (e.parameter && e.parameter.key) || '';
+    const key = (e && e.parameter && e.parameter.key) || '';
     if (key !== SECRET_KEY) {
-      return ContentService
-        .createTextOutput(JSON.stringify({ error: 'Unauthorized' }))
-        .setMimeType(ContentService.MimeType.JSON);
+      return json({ error: 'Unauthorized', hint: 'ต้องส่ง ?key=SECRET_KEY' });
     }
-
-    const result = getAllRecords();
-    return ContentService
-      .createTextOutput(JSON.stringify(result))
-      .setMimeType(ContentService.MimeType.JSON);
+    return json(getAllRecords());
   } catch (err) {
-    return ContentService
-      .createTextOutput(JSON.stringify({ error: err.message }))
-      .setMimeType(ContentService.MimeType.JSON);
+    return json({ error: err.message, stack: err.stack });
   }
+}
+
+function json(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
 }
 
 // ─── Fetch all sheets ─────────────────────────────────────────────────────────
@@ -56,15 +56,23 @@ function getAllRecords() {
   const ss      = SpreadsheetApp.getActiveSpreadsheet();
   const sheets  = ss.getSheets();
   const records = [];
+  let   sheetsProcessed = 0;
 
   for (const ws of sheets) {
     const name = ws.getName().trim();
+    // ข้ามชีทที่ไม่ใช่ข้อมูล
     if (SKIP_SHEETS.some(s => name.includes(s))) continue;
+    // ข้ามชีทที่ชื่อไม่มีเดือน (เช่น ชีทสรุป, ชีทหมายจับ)
     const recs = parseSheet(ws, name);
     records.push(...recs);
+    sheetsProcessed++;
   }
 
-  return { records: records, total: records.length };
+  return {
+    records:         records,
+    total:           records.length,
+    sheetsProcessed: sheetsProcessed
+  };
 }
 
 // ─── Parse one sheet ──────────────────────────────────────────────────────────
@@ -81,71 +89,93 @@ function parseSheet(ws, sheetName) {
     monthNum  = MONTH_MAP[monthAbbr] || 0;
   }
 
-  // Find data header row (contains "ข้อหา" and "ชื่อ")
+  // Find data header row (ต้องมี "ข้อหา" และ "ชื่อ"/"ผู้ต้องหา")
   let headerIdx = -1;
-  for (let i = 0; i < data.length; i++) {
-    const joined = data[i].join(' ');
-    if (joined.includes('ข้อหา') && (joined.includes('ชื่อ') || joined.includes('ผู้ต้องหา'))) {
+  for (let i = 0; i < Math.min(data.length, 10); i++) {
+    const joined = data[i].map(cellStr).join(' ');
+    if (joined.includes('ข้อหา') &&
+        (joined.includes('ชื่อ') || joined.includes('ผู้ต้องหา'))) {
       headerIdx = i;
       break;
     }
   }
   if (headerIdx < 0) return [];
 
-  const isNew = data[headerIdx].join(' ').match(/กลุ่มฐานความผิด|ไฟล์บันทึก/);
+  const headerText = data[headerIdx].map(cellStr).join(' ');
+  const isNew = /กลุ่มฐานความผิด|ไฟล์บันทึก/.test(headerText);
+  const COL   = isNew ? NEW_COL : OLD_COL;
 
   const records = [];
 
   for (let i = headerIdx + 1; i < data.length; i++) {
     const row = data[i];
 
-    function g(col, key) {
-      const idx = col[key];
+    // helper: get cell value as trimmed string
+    function g(key) {
+      const idx = COL[key];
       if (idx === undefined || idx < 0 || idx >= row.length) return '';
-      const v = row[idx];
-      return (v !== null && v !== undefined) ? String(v).trim() : '';
+      return cellStr(row[idx]);
     }
 
-    const name = isNew ? g(NEW_COL, 'name') : g(OLD_COL, 'name');
+    const name = g('name');
+    const seq  = g('seq');
 
-    // Skip blank / header rows
-    if (!name || name.match(/^(ชื่อ|ชื่อ \/ สกุล|ชื่อ-สกุล|ผู้ต้องหา|-+)$/)) continue;
-    if (g(isNew ? NEW_COL : OLD_COL, 'seq') === 'ลำดับ') continue;
+    // ข้ามแถวหัวตาราง / แถวว่าง
+    if (!name) continue;
+    if (/^(ชื่อ|ชื่อ \/ สกุล|ชื่อ-สกุล|ผู้ต้องหา|-+|ลำดับ)$/.test(name)) continue;
+    if (seq === 'ลำดับ') continue;
+    // ข้ามแถวที่ทุกเซลล์ว่าง
+    if (row.every(v => v === null || v === undefined || v === '')) continue;
 
     let imageUrl = null;
     if (isNew) {
-      // Column J (image) may have =IMAGE() result or direct URL
-      const imgVal  = g(NEW_COL, 'image');
-      const fileUrl = g(NEW_COL, 'file');
-      imageUrl = driveToImage(imgVal) || driveToImage(fileUrl) || (imgVal.startsWith('http') ? imgVal : null);
+      const imgVal  = g('image');
+      const fileUrl = g('file');
+      imageUrl = driveToImage(imgVal) || driveToImage(fileUrl)
+              || (imgVal.startsWith('http') ? imgVal : null);
     }
 
-    const rec = {
+    records.push({
       sheet:     sheetName,
       yearBe:    yearBe,
       monthNum:  monthNum,
       monthAbbr: monthAbbr,
-      seq:       isNew ? g(NEW_COL,'seq')      : g(OLD_COL,'seq'),
-      date:      isNew ? g(NEW_COL,'date')     : g(OLD_COL,'date'),
-      group:     isNew ? g(NEW_COL,'group')    : '',
-      charge:    isNew ? g(NEW_COL,'charge')   : g(OLD_COL,'charge'),
+      seq:       seq,
+      date:      g('date'),
+      group:     isNew ? g('group')    : '',
+      charge:    g('charge'),
       name:      name,
-      nickname:  isNew ? g(NEW_COL,'nickname') : '',
-      age:       isNew ? g(NEW_COL,'age')      : g(OLD_COL,'age'),
-      pid:       isNew ? g(NEW_COL,'pid')      : g(OLD_COL,'pid'),
-      evidence:  isNew ? g(NEW_COL,'evidence') : g(OLD_COL,'evidence'),
-      location:  isNew ? g(NEW_COL,'location') : g(OLD_COL,'location'),
-      note:      isNew ? g(NEW_COL,'note')     : '',
+      nickname:  isNew ? g('nickname') : '',
+      age:       g('age'),
+      pid:       g('pid'),
+      evidence:  g('evidence'),
+      location:  g('location'),
+      note:      isNew ? g('note')     : '',
       imageUrl:  imageUrl
-    };
-
-    records.push(rec);
+    });
   }
 
   return records;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * แปลงค่าเซลล์เป็น string รองรับ Date object
+ * กรณีที่เซลล์ใน Sheets ถูก format เป็น Date → getValues() คืน Date object
+ */
+function cellStr(v) {
+  if (v === null || v === undefined || v === '') return '';
+  if (v instanceof Date) {
+    // แปลงเป็นรูปแบบ "7 ก.ค. 69"
+    const d = v.getDate();
+    const m = v.getMonth() + 1;           // 0-based → 1-based
+    const y = (v.getFullYear() - 2500) % 100; // CE → BE 2-digit
+    return d + ' ' + (MONTH_ABBR_LIST[m] || m) + ' ' + y;
+  }
+  return String(v).trim();
+}
+
 function driveToImage(url) {
   if (!url) return null;
   const m = url.match(/drive\.google\.com\/file\/d\/([^/?&\s]+)/);
