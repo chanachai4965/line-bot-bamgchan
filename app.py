@@ -51,6 +51,7 @@ handler       = WebhookHandler(LINE_CHANNEL_SECRET)
 _cache_data: list  = []
 _cache_ts:   float = 0.0
 _cache_lock        = threading.Lock()
+_fetching:   bool  = False   # True = background fetch กำลังทำงานอยู่
 
 
 def fetch_all() -> list:
@@ -117,17 +118,43 @@ def _normalise(r: dict) -> dict:
     }
 
 
+def _do_fetch():
+    """Fetch data in background — อัปเดต cache โดยไม่ block webhook handler"""
+    global _cache_data, _cache_ts, _fetching
+    if _fetching:
+        return  # ถ้า fetch อยู่แล้ว ไม่ต้อง fetch ซ้ำ
+    _fetching = True
+    try:
+        fresh = fetch_all()
+        with _cache_lock:
+            if fresh:
+                _cache_data = fresh
+                _cache_ts   = time.time()
+    finally:
+        _fetching = False
+
+
 def get_data(force: bool = False) -> list:
+    """คืน cached data ทันที — ไม่ block webhook handler เด็ดขาด"""
     global _cache_data, _cache_ts
     with _cache_lock:
-        if not force and _cache_data and (time.time() - _cache_ts) < CACHE_TTL:
-            return _cache_data
-    fresh = fetch_all()
-    with _cache_lock:
-        if fresh:
-            _cache_data = fresh
-            _cache_ts   = time.time()
-    return fresh if fresh else _cache_data
+        snapshot = list(_cache_data)
+        ts       = _cache_ts
+
+    cache_valid = bool(snapshot) and (time.time() - ts) < CACHE_TTL
+
+    if force:
+        # /refresh endpoint: รอ fetch จริง (ไม่ใช่ webhook path)
+        _do_fetch()
+        with _cache_lock:
+            return list(_cache_data)
+
+    if cache_valid:
+        return snapshot
+
+    # Cache หมดอายุหรือว่างเปล่า → kick background fetch แล้วคืนทันที
+    threading.Thread(target=_do_fetch, daemon=True).start()
+    return snapshot  # [] ถ้ายังไม่เคย load
 
 
 # ─── Thai month helpers ───────────────────────────────────────────────────────
@@ -463,6 +490,13 @@ def handle_message(text: str) -> list:
     data = get_data()
     t    = text.strip()
 
+    # ── ยังโหลดไม่เสร็จ ──
+    if not data:
+        return [TextMessage(text=(
+            "⏳ ระบบกำลังโหลดข้อมูลจาก Google Sheets\n"
+            "กรุณาลองใหม่อีกครั้งใน 1-2 นาที"
+        ))]
+
     # ── ช่วยเหลือ ──
     if re.match(r'^(ช่วย|help|ช่วยเหลือ|คำสั่ง)$', t, re.IGNORECASE):
         return [TextMessage(text=HELP_TEXT)]
@@ -567,8 +601,16 @@ def handle_message(text: str) -> list:
             return [TextMessage(text=f"❌ ไม่พบข้อหา '{kw}'")]
         return [build_summary_flex(f"⚖️ {kw}", total, _cat_count(rows), rows)]
 
-    # ── ไม่รู้จักคำสั่ง ──
-    return [TextMessage(text=f"❓ ไม่เข้าใจคำสั่ง '{t}'\nพิมพ์ bot ช่วยเหลือ เพื่อดูคำสั่งทั้งหมด")]
+    # ── fallback: ลองค้นหาชื่อ (รองรับพิมพ์ชื่อตรงๆ ไม่ต้องมีคำนำหน้า) ──
+    if len(t) >= 2:
+        rows, total = search_name(t, data)
+        if rows:
+            return [
+                TextMessage(text=f"🔍 ค้นหา: {t}\nพบทั้งหมด {total} ราย (แสดง {len(rows)} ล่าสุด)"),
+                build_carousel(rows[:10], f"ค้นหา: {t}"),
+            ]
+
+    return [TextMessage(text=f"❓ ไม่พบ '{t}' ในระบบ\nพิมพ์ bot ช่วยเหลือ เพื่อดูคำสั่งทั้งหมด")]
 
 
 # ─── LINE reply / push ────────────────────────────────────────────────────────
@@ -674,7 +716,7 @@ def ping():
 
 @app.route('/refresh')
 def http_refresh():
-    threading.Thread(target=lambda: get_data(force=True), daemon=True).start()
+    threading.Thread(target=_do_fetch, daemon=True).start()
     return 'refreshing...', 200
 
 
@@ -727,7 +769,7 @@ def debug():
 
 # ─── Startup preload ──────────────────────────────────────────────────────────
 # ทำงานตอน gunicorn import module — ไม่ใช้ if __name__ เพราะ gunicorn ไม่รัน block นั้น
-threading.Thread(target=get_data, daemon=True).start()
+threading.Thread(target=_do_fetch, daemon=True).start()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
