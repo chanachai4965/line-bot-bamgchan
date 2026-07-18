@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 LINE Bot — ระบบสืบค้นผลการจับกุม สน.บางชัน
-v4.0 — Apps Script Edition (ไม่ต้องใช้ Service Account)
+v4.3 — Apps Script Edition (แสดงรูปภาพ + รายการต่อเนื่อง)
 ดึงข้อมูลจาก Google Apps Script Web App → cache ใน RAM → ตอบ Flex Message
 """
 
@@ -474,6 +474,99 @@ def build_summary_flex(title: str, total: int, cat: dict, records: list) -> Flex
                        contents=FlexContainer.from_dict(bubble))
 
 
+
+# ─── Continuation text helpers ────────────────────────────────────────────────
+LINE_TEXT_LIMIT = 4800  # เผื่อจากขีดจำกัดข้อความ LINE 5,000 ตัวอักษร
+
+
+def _record_text_line(rec: dict, index: int) -> str:
+    """แปลงข้อมูลหนึ่งรายการเป็นข้อความสั้นสำหรับรายการที่เกิน 10 ราย"""
+    name = rec.get('name', '-') or '-'
+    charge = rec.get('charge', '') or ''
+    date = rec.get('date', '') or ''
+    location = rec.get('location', '') or ''
+
+    parts = [f"{index}. {name}"]
+    if charge:
+        parts.append(f"   ข้อหา: {charge}")
+    if date:
+        parts.append(f"   วันที่: {date}")
+    if location:
+        parts.append(f"   สถานที่: {location}")
+    return "\n".join(parts)
+
+
+def _chunk_text(header: str, blocks: list[str]) -> list[TextMessage]:
+    """แบ่งข้อความยาวเป็นหลายข้อความ โดยไม่เกินขีดจำกัดของ LINE"""
+    if not blocks:
+        return []
+
+    messages = []
+    current = header.strip()
+
+    for block in blocks:
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) > LINE_TEXT_LIMIT and current:
+            messages.append(TextMessage(text=current))
+            current = block
+        else:
+            current = candidate
+
+    if current:
+        messages.append(TextMessage(text=current))
+
+    return messages
+
+
+def build_remaining_text_messages(records: list, start_index: int = 11,
+                                  title: str = "รายชื่อเพิ่มเติม") -> list:
+    """สร้างข้อความธรรมดาสำหรับข้อมูลตั้งแต่รายการที่ 11 เป็นต้นไป"""
+    if not records:
+        return []
+
+    blocks = [
+        _record_text_line(rec, start_index + offset)
+        for offset, rec in enumerate(records)
+    ]
+    header = f"📋 {title}\nแสดงรายการที่ {start_index}-{start_index + len(records) - 1}"
+    return _chunk_text(header, blocks)
+
+
+def build_summary_messages(title: str, rows: list) -> list:
+    """
+    ส่ง Flex สรุป 10 รายแรก และรายการที่เหลือเป็นข้อความธรรมดา
+    LINE reply ได้สูงสุด 5 messages จึงใช้ Flex 1 + ข้อความต่อเนื่องสูงสุด 4
+    """
+    messages = [
+        build_summary_flex(title, len(rows), _cat_count(rows), rows)
+    ]
+    remaining = build_remaining_text_messages(
+        rows[10:],
+        start_index=11,
+        title=f"{title} — รายการต่อจากการ์ด"
+    )
+    messages.extend(remaining[:4])
+    return messages[:5]
+
+
+def build_search_messages(prefix: str, rows: list, total: int, alt: str) -> list:
+    """ผลค้นหา: ข้อความสรุป + การ์ดสูงสุด 10 + รายการที่เหลือเป็นข้อความ"""
+    messages = [
+        TextMessage(
+            text=f"{prefix}\nพบทั้งหมด {total} ราย "
+                 f"(แสดงการ์ด {min(len(rows), 10)} รายแรก)"
+        ),
+        build_carousel(rows[:10], alt),
+    ]
+    remaining = build_remaining_text_messages(
+        rows[10:],
+        start_index=11,
+        title="ผลค้นหาเพิ่มเติม"
+    )
+    messages.extend(remaining[:3])
+    return messages[:5]
+
+
 # ─── Command router ───────────────────────────────────────────────────────────
 LOCATION_PREFIX_RE = re.compile(
     r'^(ชุมชน|ซอย|ถ\.|ถนน|หมู่บ้าน|สน\.|ริมคลอง|ริมถนน|ริม|แยก|'
@@ -572,10 +665,9 @@ def handle_message(text: str) -> list:
         rows, total = search_name(kw, data)
         if not rows:
             return [TextMessage(text=f"❌ ไม่พบ '{kw}' ในระบบ")]
-        return [
-            TextMessage(text=f"🔍 ค้นหา: {kw}\nพบทั้งหมด {total} ราย (แสดง {len(rows)} ล่าสุด)"),
-            build_carousel(rows[:10], f"ค้นหา: {kw}"),
-        ]
+        return build_search_messages(
+            f"🔍 ค้นหา: {kw}", rows, total, f"ค้นหา: {kw}"
+        )
 
     # ── เดือน (explicit) ──
     m = re.match(r'^เดือน\s+(.+)$', t)
@@ -586,7 +678,7 @@ def handle_message(text: str) -> list:
             if not rows:
                 return [TextMessage(text="❌ ไม่พบข้อมูลเดือนนั้น")]
             abbr = MONTH_NUM_TO_ABBR.get(mn, '')
-            return [build_summary_flex(f"สรุป {abbr} {yr}", len(rows), _cat_count(rows), rows)]
+            return build_summary_messages(f"สรุป {abbr} {yr}", rows)
         return [TextMessage(text="❓ รูปแบบเดือนไม่ถูกต้อง เช่น เดือน ก.ค. 69")]
 
     # ── เดือน/ปี พิมพ์ตรง ──
@@ -597,7 +689,7 @@ def handle_message(text: str) -> list:
             if not rows:
                 return [TextMessage(text="❌ ไม่พบข้อมูลเดือนนั้น")]
             abbr = MONTH_NUM_TO_ABBR.get(mn, '')
-            return [build_summary_flex(f"สรุป {abbr} {yr}", len(rows), _cat_count(rows), rows)]
+            return build_summary_messages(f"สรุป {abbr} {yr}", rows)
 
     # ── ปี ──
     m = re.match(r'^ปี\s*(25[5-9]\d|26\d{2}|[5-9]\d)$', t)
@@ -607,7 +699,7 @@ def handle_message(text: str) -> list:
         rows = yearly(ybe, data)
         if not rows:
             return [TextMessage(text=f"❌ ไม่พบข้อมูลปี {ybe}")]
-        return [build_summary_flex(f"สรุปปี {ybe}", len(rows), _cat_count(rows), rows)]
+        return build_summary_messages(f"สรุปปี {ybe}", rows)
 
     # ── สถานที่ (explicit) ──
     m = re.match(r'^สถานที่\s+(.+)$', t)
@@ -616,13 +708,13 @@ def handle_message(text: str) -> list:
         rows, total = search_location(kw, data)
         if not rows:
             return [TextMessage(text=f"❌ ไม่พบสถานที่ '{kw}'")]
-        return [build_summary_flex(f"📍 {kw}", total, _cat_count(rows), rows)]
+        return build_summary_messages(f"📍 {kw}", rows)
 
     # ── สถานที่ (auto-detect prefix) ──
     if LOCATION_PREFIX_RE.match(t):
         rows, total = search_location(t, data)
         if rows:
-            return [build_summary_flex(f"📍 {t}", total, _cat_count(rows), rows)]
+            return build_summary_messages(f"📍 {t}", rows)
 
     # ── ของกลาง ──
     m = re.match(r'^ของกลาง\s+(.+)$', t)
@@ -631,10 +723,9 @@ def handle_message(text: str) -> list:
         rows, total = search_evidence(kw, data)
         if not rows:
             return [TextMessage(text=f"❌ ไม่พบของกลาง '{kw}'")]
-        return [
-            TextMessage(text=f"📦 ของกลาง: {kw}\nพบทั้งหมด {total} ราย (แสดง {len(rows)} ล่าสุด)"),
-            build_carousel(rows[:10], f"ของกลาง: {kw}"),
-        ]
+        return build_search_messages(
+            f"📦 ของกลาง: {kw}", rows, total, f"ของกลาง: {kw}"
+        )
 
     # ── ข้อหา ──
     m = re.match(r'^ข้อหา\s+(.+)$', t)
@@ -643,16 +734,15 @@ def handle_message(text: str) -> list:
         rows, total = search_charge(kw, data)
         if not rows:
             return [TextMessage(text=f"❌ ไม่พบข้อหา '{kw}'")]
-        return [build_summary_flex(f"⚖️ {kw}", total, _cat_count(rows), rows)]
+        return build_summary_messages(f"⚖️ {kw}", rows)
 
     # ── fallback: ลองค้นหาชื่อ (รองรับพิมพ์ชื่อตรงๆ ไม่ต้องมีคำนำหน้า) ──
     if len(t) >= 2:
         rows, total = search_name(t, data)
         if rows:
-            return [
-                TextMessage(text=f"🔍 ค้นหา: {t}\nพบทั้งหมด {total} ราย (แสดง {len(rows)} ล่าสุด)"),
-                build_carousel(rows[:10], f"ค้นหา: {t}"),
-            ]
+            return build_search_messages(
+                f"🔍 ค้นหา: {t}", rows, total, f"ค้นหา: {t}"
+            )
 
     return [TextMessage(text=f"❓ ไม่พบ '{t}' ในระบบ\nพิมพ์ bot ช่วยเหลือ เพื่อดูคำสั่งทั้งหมด")]
 
@@ -778,7 +868,7 @@ def index():
         n = len(_cache_data)
         ts = _cache_ts
     age = int(time.time() - ts) if ts else -1
-    return f'LINE Bot สน.บางชัน v4.2 | {n} records | cache age {age}s', 200
+    return f'LINE Bot สน.บางชัน v4.3 | {n} records | cache age {age}s', 200
 
 
 @app.route('/debug')
