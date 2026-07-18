@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 LINE Bot — ระบบสืบค้นผลการจับกุม สน.บางชัน
-v5.0 — เพิ่มฐานข้อมูลบุคลากร ชุดปฏิบัติการ และเวรวันคู่/วันคี่
+v6.0 — แยกโหลดข้อมูลคดีและบุคลากร ลดปัญหา Apps Script timeout
 ดึงข้อมูลจาก Google Apps Script Web App → cache ใน RAM → ตอบ Flex Message
 """
 
@@ -42,184 +42,195 @@ LINE_CHANNEL_ACCESS_TOKEN  = os.environ['LINE_CHANNEL_ACCESS_TOKEN']
 APPS_SCRIPT_URL            = os.environ['APPS_SCRIPT_URL']
 # Secret key สำหรับป้องกัน Apps Script ถูกเรียกโดยคนอื่น (ต้องตรงกับ Code.gs)
 APPS_SCRIPT_KEY            = os.environ.get('APPS_SCRIPT_KEY', '')
-CACHE_TTL                  = int(os.environ.get('CACHE_TTL', '300'))   # วินาที
-FETCH_TIMEOUT              = int(os.environ.get('FETCH_TIMEOUT', '90')) # วินาที
+ARREST_CACHE_TTL           = int(os.environ.get('ARREST_CACHE_TTL', '900'))
+STAFF_CACHE_TTL            = int(os.environ.get('STAFF_CACHE_TTL', '300'))
+ARREST_FETCH_TIMEOUT       = int(os.environ.get('ARREST_FETCH_TIMEOUT', '180'))
+STAFF_FETCH_TIMEOUT        = int(os.environ.get('STAFF_FETCH_TIMEOUT', '45'))
 DETAIL_LIMIT               = 30
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler       = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# ─── Data cache ───────────────────────────────────────────────────────────────
-# ห้ามเริ่ม background thread ตอน import module:
-# Gunicorn อาจ import ใน master process ก่อน fork worker ทำให้ cache อยู่ผิด process
-_cache_data:  list = []
+# ─── แยก Cache: ข้อมูลคดี / ข้อมูลบุคลากร ───────────────────────────────────
+_arrest_data: list = []
 _staff_data: list = []
-_cache_ts:  float = 0.0
-_cache_lock        = threading.RLock()
-_fetch_state_lock  = threading.Lock()
-_fetching:   bool  = False
+_arrest_ts: float = 0.0
+_staff_ts: float = 0.0
+
+_arrest_lock = threading.RLock()
+_staff_lock = threading.RLock()
+_arrest_state_lock = threading.Lock()
+_staff_state_lock = threading.Lock()
+_arrest_fetching = False
+_staff_fetching = False
 
 
-def fetch_all() -> tuple[list, list]:
-    """เรียก Apps Script → คืน (ข้อมูลจับกุม, ข้อมูลบุคลากร)"""
-    try:
-        params = {'key': APPS_SCRIPT_KEY} if APPS_SCRIPT_KEY else {}
-        log.info(f'[fetch] GET {APPS_SCRIPT_URL} key={bool(APPS_SCRIPT_KEY)}')
-        resp = requests.get(
-            APPS_SCRIPT_URL, params=params,
-            timeout=FETCH_TIMEOUT, allow_redirects=True
-        )
-        log.info(f'[fetch] HTTP {resp.status_code} url={resp.url[:80]}')
-
-        ct = resp.headers.get('Content-Type', '')
-        if 'html' in ct:
-            log.error('[fetch] got HTML instead of JSON')
-            log.error(f'[fetch] first 300 chars: {resp.text[:300]}')
-            return list(_cache_data), list(_staff_data)
-
-        resp.raise_for_status()
-        payload = resp.json()
-
-        if 'error' in payload:
-            log.error(f'[fetch] Apps Script returned error: {payload["error"]}')
-            return list(_cache_data), list(_staff_data)
-
-        records = [_normalise(r) for r in payload.get('records', [])]
-        staff = [_normalise_staff(r) for r in payload.get('staff', [])]
-
-        log.info(
-            f'[fetch] ✅ loaded arrests={len(records)} staff={len(staff)} '
-            f'(sheets={payload.get("sheetsProcessed","?")})'
-        )
-        return records, staff
-
-    except requests.exceptions.Timeout:
-        log.error(f'[fetch] ⏱ timeout after {FETCH_TIMEOUT}s')
-        return list(_cache_data), list(_staff_data)
-    except Exception as e:
-        log.error(f'[fetch] {e}', exc_info=True)
-        return list(_cache_data), list(_staff_data)
+def _request_api(mode: str, timeout: int) -> dict:
+    params = {'mode': mode}
+    if APPS_SCRIPT_KEY:
+        params['key'] = APPS_SCRIPT_KEY
+    log.info(f'[fetch:{mode}] GET Apps Script timeout={timeout}s')
+    resp = requests.get(
+        APPS_SCRIPT_URL,
+        params=params,
+        timeout=timeout,
+        allow_redirects=True,
+    )
+    log.info(f'[fetch:{mode}] HTTP {resp.status_code}')
+    if 'html' in resp.headers.get('Content-Type', '').lower():
+        raise RuntimeError('Apps Script ส่ง HTML กลับมาแทน JSON')
+    resp.raise_for_status()
+    payload = resp.json()
+    if payload.get('error'):
+        raise RuntimeError(payload['error'])
+    return payload
 
 
 def _normalise(r: dict) -> dict:
-    """แปลงข้อมูลจับกุมจาก Apps Script"""
     return {
-        'sheet':      r.get('sheet', ''),
-        'year_be':    int(r.get('yearBe', 0) or 0),
-        'month_num':  int(r.get('monthNum', 0) or 0),
+        'sheet': r.get('sheet', ''),
+        'year_be': int(r.get('yearBe', 0) or 0),
+        'month_num': int(r.get('monthNum', 0) or 0),
         'month_abbr': r.get('monthAbbr', ''),
-        'seq':        r.get('seq', ''),
-        'date':       r.get('date', ''),
-        'group':      r.get('group', ''),
-        'charge':     r.get('charge', ''),
-        'name':       r.get('name', ''),
-        'nickname':   r.get('nickname', ''),
-        'age':        r.get('age', ''),
-        'pid':        r.get('pid', ''),
-        'evidence':   r.get('evidence', ''),
-        'location':   r.get('location', ''),
-        'note':       r.get('note', ''),
-        'image_url':  r.get('imageUrl'),
+        'seq': r.get('seq', ''),
+        'date': r.get('date', ''),
+        'group': r.get('group', ''),
+        'charge': r.get('charge', ''),
+        'name': r.get('name', ''),
+        'nickname': r.get('nickname', ''),
+        'age': r.get('age', ''),
+        'pid': r.get('pid', ''),
+        'evidence': r.get('evidence', ''),
+        'location': r.get('location', ''),
+        'note': r.get('note', ''),
+        'image_url': r.get('imageUrl'),
     }
 
 
 def _normalise_staff(r: dict) -> dict:
-    """แปลงข้อมูลบุคลากรจาก Apps Script"""
     try:
         team = int(r.get('team', 0) or 0)
     except (TypeError, ValueError):
         team = 0
-
     return {
-        'name':       str(r.get('name', '') or '').strip(),
-        'position':   str(r.get('position', '') or '').strip(),
-        'phone':      str(r.get('phone', '') or '').strip(),
-        'nickname':   str(r.get('nickname', '') or '').strip(),
-        'image_url':  r.get('imageUrl'),
-        'note':       str(r.get('note', '') or '').strip(),
-        'team':       team,
+        'name': str(r.get('name', '') or '').strip(),
+        'position': str(r.get('position', '') or '').strip(),
+        'phone': str(r.get('phone', '') or '').strip(),
+        'nickname': str(r.get('nickname', '') or '').strip(),
+        'image_url': r.get('imageUrl'),
+        'note': str(r.get('note', '') or '').strip(),
+        'team': team,
     }
 
 
-def _do_fetch():
-    """โหลดข้อมูลทั้งหมดและอัปเดต cache ใน worker process"""
-    global _cache_ts, _fetching
+def fetch_arrests() -> list:
+    payload = _request_api('arrests', ARREST_FETCH_TIMEOUT)
+    rows = [_normalise(r) for r in payload.get('records', [])]
+    log.info(f'[fetch:arrests] ✅ {len(rows)} records')
+    return rows
 
-    with _fetch_state_lock:
-        if _fetching:
-            log.info('[cache] fetch already running')
+
+def fetch_staff() -> list:
+    payload = _request_api('staff', STAFF_FETCH_TIMEOUT)
+    rows = [_normalise_staff(r) for r in payload.get('staff', [])]
+    log.info(f'[fetch:staff] ✅ {len(rows)} people')
+    return rows
+
+
+def _do_fetch_arrests():
+    global _arrest_ts, _arrest_fetching
+    with _arrest_state_lock:
+        if _arrest_fetching:
             return
-        _fetching = True
-
+        _arrest_fetching = True
     try:
-        fresh_records, fresh_staff = fetch_all()
-        if fresh_records or fresh_staff:
-            with _cache_lock:
-                if fresh_records:
-                    _cache_data.clear()
-                    _cache_data.extend(fresh_records)
-                if fresh_staff:
-                    _staff_data.clear()
-                    _staff_data.extend(fresh_staff)
-                _cache_ts = time.time()
-                arrest_count = len(_cache_data)
-                staff_count = len(_staff_data)
-            log.info(
-                f'[cache] updated arrests={arrest_count} staff={staff_count}'
-            )
-        else:
-            log.warning('[cache] fetch returned no data; keeping old cache')
+        rows = fetch_arrests()
+        if rows:
+            with _arrest_lock:
+                _arrest_data.clear()
+                _arrest_data.extend(rows)
+                _arrest_ts = time.time()
+    except requests.exceptions.Timeout:
+        log.error(f'[fetch:arrests] timeout after {ARREST_FETCH_TIMEOUT}s')
+    except Exception as e:
+        log.error(f'[fetch:arrests] {e}', exc_info=True)
     finally:
-        with _fetch_state_lock:
-            _fetching = False
+        with _arrest_state_lock:
+            _arrest_fetching = False
 
 
-def _start_fetch_background() -> bool:
-    with _fetch_state_lock:
-        if _fetching:
+def _do_fetch_staff():
+    global _staff_ts, _staff_fetching
+    with _staff_state_lock:
+        if _staff_fetching:
+            return
+        _staff_fetching = True
+    try:
+        rows = fetch_staff()
+        if rows:
+            with _staff_lock:
+                _staff_data.clear()
+                _staff_data.extend(rows)
+                _staff_ts = time.time()
+    except requests.exceptions.Timeout:
+        log.error(f'[fetch:staff] timeout after {STAFF_FETCH_TIMEOUT}s')
+    except Exception as e:
+        log.error(f'[fetch:staff] {e}', exc_info=True)
+    finally:
+        with _staff_state_lock:
+            _staff_fetching = False
+
+
+def _start_arrest_fetch() -> bool:
+    with _arrest_state_lock:
+        if _arrest_fetching:
             return False
-
-    threading.Thread(
-        target=_do_fetch,
-        name='apps-script-fetch',
-        daemon=True
-    ).start()
+    threading.Thread(target=_do_fetch_arrests, daemon=True, name='fetch-arrests').start()
     return True
 
 
-def get_data(force: bool = False) -> tuple[list, list]:
-    """คืน (ข้อมูลจับกุม, บุคลากร) แบบ stale-while-revalidate"""
-    with _cache_lock:
-        records_snapshot = list(_cache_data)
-        staff_snapshot = list(_staff_data)
-        ts = _cache_ts
+def _start_staff_fetch() -> bool:
+    with _staff_state_lock:
+        if _staff_fetching:
+            return False
+    threading.Thread(target=_do_fetch_staff, daemon=True, name='fetch-staff').start()
+    return True
 
-    has_cache = bool(records_snapshot or staff_snapshot)
-    age = (time.time() - ts) if ts else None
-    cache_expired = has_cache and age is not None and age >= CACHE_TTL
 
+def get_arrests(force: bool = False) -> list:
+    with _arrest_lock:
+        snapshot = list(_arrest_data)
+        ts = _arrest_ts
     if force:
-        _do_fetch()
-        with _cache_lock:
-            result = (list(_cache_data), list(_staff_data))
-        log.info(
-            f'[cache] force arrests={len(result[0])} staff={len(result[1])}'
-        )
-        return result
+        _do_fetch_arrests()
+        with _arrest_lock:
+            return list(_arrest_data)
+    if snapshot:
+        if ts and time.time() - ts >= ARREST_CACHE_TTL:
+            _start_arrest_fetch()
+        return snapshot
+    _start_arrest_fetch()
+    return []
 
-    if has_cache:
-        if cache_expired:
-            started = _start_fetch_background()
-            log.info(
-                f'[cache] stale arrests={len(records_snapshot)} '
-                f'staff={len(staff_snapshot)} age={int(age)}s '
-                f'refresh_started={started}'
-            )
-        return records_snapshot, staff_snapshot
 
-    started = _start_fetch_background()
-    log.info(f'[cache] empty - background_started={started}')
-    return [], []
+def get_staff(force: bool = False, wait_if_empty: bool = False) -> list:
+    with _staff_lock:
+        snapshot = list(_staff_data)
+        ts = _staff_ts
+    if force:
+        _do_fetch_staff()
+        with _staff_lock:
+            return list(_staff_data)
+    if snapshot:
+        if ts and time.time() - ts >= STAFF_CACHE_TTL:
+            _start_staff_fetch()
+        return snapshot
+    if wait_if_empty:
+        _do_fetch_staff()
+        with _staff_lock:
+            return list(_staff_data)
+    _start_staff_fetch()
+    return []
 
 
 # ─── Thai month helpers ───────────────────────────────────────────────────────
@@ -795,17 +806,12 @@ def _cat_count(rows: list) -> dict:
 def handle_message(text: str) -> list:
     t = text.strip()
     log.info(f'[message] text={t!r}')
-    data, staff = get_data()
+    # โหลดบุคลากรก่อน เพราะมีขนาดเล็กและใช้เวลาสั้น
+    staff = get_staff(wait_if_empty=True)
+    data = get_arrests()
     log.info(
-        f'[message] cache_records={len(data)} staff_records={len(staff)}'
+        f'[message] arrest_records={len(data)} staff_records={len(staff)}'
     )
-
-    # ── ยังโหลดไม่เสร็จ ──
-    if not data and not staff:
-        return [TextMessage(text=(
-            "⏳ ระบบกำลังโหลดข้อมูลจาก Google Sheets\n"
-            "กรุณาลองใหม่อีกครั้งใน 1-2 นาที"
-        ))]
 
     # ── ช่วยเหลือ ──
     if re.match(r'^(ช่วย|help|ช่วยเหลือ|คำสั่ง)$', t, re.IGNORECASE):
@@ -813,6 +819,8 @@ def handle_message(text: str) -> list:
 
     # ── สถิติ ──
     if re.match(r'^สถิติ$', t):
+        if not data:
+            return [TextMessage(text="⏳ ข้อมูลคดีกำลังโหลด กรุณาลองใหม่อีกครั้งใน 1-2 นาที")]
         total, by_cat, by_year = statistics(data)
         top = sorted(by_year.items(), reverse=True)[:5]
         yr_txt = '\n'.join(f"  ปี {yr}: {cnt:,} ราย" for yr, cnt in top)
@@ -828,8 +836,13 @@ def handle_message(text: str) -> list:
 
     # ── รีเฟรช ──
     if re.match(r'^(รีเฟรช|refresh|โหลดใหม่)$', t, re.IGNORECASE):
-        threading.Thread(target=lambda: get_data(force=True), daemon=True).start()
-        return [TextMessage(text="🔄 กำลังโหลดข้อมูลใหม่จาก Apps Script...")]
+        _start_staff_fetch()
+        _start_arrest_fetch()
+        return [TextMessage(text=(
+            "🔄 เริ่มโหลดข้อมูลใหม่แล้ว\n"
+            "• บุคลากรจะพร้อมก่อน\n"
+            "• ข้อมูลคดีโหลดแยกในพื้นหลัง"
+        ))]
 
     # ── ชุดปฏิบัติการ ──
     team = parse_team_command(t)
@@ -860,6 +873,13 @@ def handle_message(text: str) -> list:
         return build_staff_carousels(
             people, f"ผลค้นหาบุคลากร: {keyword}"
         )
+
+    # คำสั่งตั้งแต่ส่วนนี้ต้องใช้ฐานข้อมูลคดี
+    if not data:
+        return [TextMessage(text=(
+            "⏳ ข้อมูลคดีกำลังโหลดจาก Google Sheets\n"
+            "ฐานข้อมูลบุคลากรใช้งานได้แล้ว แต่ข้อมูลคดีอาจใช้เวลา 1-2 นาที"
+        ))]
 
     # ── ค้นหาชื่อ ──
     m = re.match(r'^ค้นหา\s+(.+)$', t)
@@ -1043,11 +1063,13 @@ def on_unfollow(_event):
 # ─── Flask routes ─────────────────────────────────────────────────────────────
 @app.route('/callback', methods=['POST'])
 def callback():
-    # ทำงานใน worker process จริง จึงใช้เริ่ม cache loader ได้อย่างปลอดภัย
-    if not _cache_data:
-        _start_fetch_background()
+    # บุคลากรโหลดแยกและเร็วกว่าข้อมูลคดี
+    if not _staff_data:
+        _start_staff_fetch()
+    if not _arrest_data:
+        _start_arrest_fetch()
 
-    sig  = request.headers.get('X-Line-Signature','')
+    sig = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
     try:
         handler.handle(body, sig)
@@ -1065,69 +1087,44 @@ def ping():
 
 @app.route('/refresh')
 def http_refresh():
-    threading.Thread(target=_do_fetch, daemon=True).start()
-    return 'refreshing...', 200
+    _start_staff_fetch()
+    _start_arrest_fetch()
+    return 'refreshing staff and arrests separately...', 200
 
 
 @app.route('/')
 def index():
-    # Render เรียกหน้า / หลัง worker พร้อมใช้งาน จึงใช้จุดนี้ preload cache
-    if not _cache_data:
-        _start_fetch_background()
-
-    with _cache_lock:
-        n = len(_cache_data)
+    if not _staff_data:
+        _start_staff_fetch()
+    if not _arrest_data:
+        _start_arrest_fetch()
+    with _arrest_lock:
+        arrest_n = len(_arrest_data)
+        arrest_age = int(time.time() - _arrest_ts) if _arrest_ts else -1
+    with _staff_lock:
         staff_n = len(_staff_data)
-        ts = _cache_ts
-    age = int(time.time() - ts) if ts else -1
+        staff_age = int(time.time() - _staff_ts) if _staff_ts else -1
     return (
-        f'LINE Bot สน.บางชัน v5.0 | arrests {n} | '
-        f'staff {staff_n} | cache age {age}s'
+        f'LINE Bot สน.บางชัน v6.0 | arrests {arrest_n} age {arrest_age}s | '
+        f'staff {staff_n} age {staff_age}s'
     ), 200
 
 
 @app.route('/debug')
 def debug():
-    """ทดสอบการเชื่อมต่อ Apps Script และแสดง raw response"""
-    import json as _json
-    try:
-        params = {'key': APPS_SCRIPT_KEY} if APPS_SCRIPT_KEY else {}
-        resp   = requests.get(
-            APPS_SCRIPT_URL, params=params,
-            timeout=FETCH_TIMEOUT, allow_redirects=True
-        )
-        ct      = resp.headers.get('Content-Type', '')
-        preview = resp.text[:500]
+    lines = ['=== LINE Bot v6 Debug ===']
+    for mode, timeout in [('staff', STAFF_FETCH_TIMEOUT), ('arrests', ARREST_FETCH_TIMEOUT)]:
         try:
-            payload  = resp.json()
-            n_rec    = len(payload.get('records', []))
-            n_staff  = len(payload.get('staff', []))
-            sheets   = payload.get('sheetsProcessed', '?')
-            err_msg  = payload.get('error', None)
-            status   = (
-                f'OK — arrests {n_rec}, staff {n_staff}, {sheets} sheets'
-            )
-            if err_msg:
-                status = f'ERROR: {err_msg}'
-        except Exception:
-            n_rec  = 0
-            status = 'JSON parse failed'
-
-        lines = [
-            f'=== Debug: Apps Script ===',
-            f'URL: {resp.url[:100]}',
-            f'HTTP: {resp.status_code}',
-            f'Content-Type: {ct}',
-            f'Apps Script status: {status}',
-            f'Cache: arrests {len(_cache_data)}, staff {len(_staff_data)}, '
-            f'age {int(time.time()-_cache_ts) if _cache_ts else -1}s',
-            f'',
-            f'--- Response preview (first 500 chars) ---',
-            preview,
-        ]
-        return '\n'.join(lines), 200, {'Content-Type': 'text/plain; charset=utf-8'}
-    except Exception as e:
-        return f'debug error: {e}', 500
+            payload = _request_api(mode, timeout)
+            count = len(payload.get('staff', [])) if mode == 'staff' else len(payload.get('records', []))
+            lines.append(f'{mode}: OK — {count} records')
+        except Exception as e:
+            lines.append(f'{mode}: ERROR — {e}')
+    with _arrest_lock:
+        lines.append(f'arrest cache: {len(_arrest_data)}')
+    with _staff_lock:
+        lines.append(f'staff cache: {len(_staff_data)}')
+    return '\n'.join(lines), 200, {'Content-Type': 'text/plain; charset=utf-8'}
 
 
 # ─── Startup preload ──────────────────────────────────────────────────────────
