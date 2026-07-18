@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 LINE Bot — ระบบสืบค้นผลการจับกุม สน.บางชัน
-v4.1 — Apps Script Edition (ปรับ cache / search / logging)
-ดึงข้อมูลจาก Google Apps Script Web App → cache ใน RAM → ตอบ Flex Message
+v4.1 — Apps Script Edition
+- Cache: คืน stale data ทันที, ไม่ขึ้น "⏳" ถ้ายังมี cache เก่า
+- Search: token-based matching, normalise whitespace, ค้นจากชื่อเล่นด้วย
+- Cards: 10 รายการแรก → Flex carousel, รายการที่ 11-30 → text list
 """
 
 import os
@@ -40,7 +42,7 @@ LINE_CHANNEL_ACCESS_TOKEN  = os.environ['LINE_CHANNEL_ACCESS_TOKEN']
 APPS_SCRIPT_URL            = os.environ['APPS_SCRIPT_URL']
 # Secret key สำหรับป้องกัน Apps Script ถูกเรียกโดยคนอื่น (ต้องตรงกับ Code.gs)
 APPS_SCRIPT_KEY            = os.environ.get('APPS_SCRIPT_KEY', '')
-CACHE_TTL                  = int(os.environ.get('CACHE_TTL', '300'))   # วินาที
+CACHE_TTL                  = int(os.environ.get('CACHE_TTL', '300'))    # วินาที
 FETCH_TIMEOUT              = int(os.environ.get('FETCH_TIMEOUT', '90')) # วินาที
 DETAIL_LIMIT               = 30
 
@@ -68,7 +70,7 @@ def fetch_all() -> list:
         # ตรวจสอบว่า response เป็น JSON จริง ไม่ใช่ HTML error page
         ct = resp.headers.get('Content-Type', '')
         if 'html' in ct:
-            log.error(f'[fetch] got HTML instead of JSON — Apps Script may need authorization')
+            log.error('[fetch] got HTML instead of JSON — Apps Script may need authorization')
             log.error(f'[fetch] first 300 chars: {resp.text[:300]}')
             return _cache_data
 
@@ -79,7 +81,7 @@ def fetch_all() -> list:
             err = payload['error']
             log.error(f'[fetch] Apps Script returned error: {err}')
             if err == 'Unauthorized':
-                log.error(f'[fetch] ❌ KEY ไม่ตรง — ตรวจสอบ APPS_SCRIPT_KEY และ SECRET_KEY ใน Code.gs')
+                log.error('[fetch] ❌ KEY ไม่ตรง — ตรวจสอบ APPS_SCRIPT_KEY และ SECRET_KEY ใน Code.gs')
             return _cache_data
 
         raw_records: list = payload.get('records', [])
@@ -135,35 +137,50 @@ def _do_fetch():
 
 
 def get_data(force: bool = False) -> list:
-    """ใช้ cache แบบ stale-while-revalidate: มีข้อมูลเก่าให้ตอบก่อน แล้วค่อยอัปเดตเบื้องหลัง"""
+    """คืน cached data ทันที — ไม่ block webhook handler เด็ดขาด
+    - cache ว่างเปล่า (ครั้งแรก): เริ่ม fetch + คืน []
+    - cache มีข้อมูลและยังใหม่: คืนทันที
+    - cache มีข้อมูลแต่หมดอายุ: เริ่ม background refresh + คืน stale data ทันที
+      (ไม่แสดง ⏳ loading message กับผู้ใช้)
+    """
     global _cache_data, _cache_ts
     with _cache_lock:
         snapshot = list(_cache_data)
         ts       = _cache_ts
 
-    age = time.time() - ts if ts else -1
-    cache_valid = bool(snapshot) and age < CACHE_TTL
+    cache_valid = bool(snapshot) and (time.time() - ts) < CACHE_TTL
 
     if force:
-        log.info('[cache] force refresh requested')
+        # /refresh endpoint: รอ fetch จริง (ไม่ใช่ webhook path)
         _do_fetch()
         with _cache_lock:
             return list(_cache_data)
 
     if cache_valid:
-        log.info(f'[cache] hit records={len(snapshot)} age={int(age)}s')
         return snapshot
 
-    # ถ้ามี cache เก่า ให้ตอบจากข้อมูลเดิมทันทีและรีเฟรชเบื้องหลัง
-    if snapshot:
-        log.info(f'[cache] stale records={len(snapshot)} age={int(age)}s — refreshing in background')
+    # Cache หมดอายุหรือว่างเปล่า → เริ่ม background fetch แล้วคืนทันที
+    # ถ้ามี stale data → คืน stale data (ผู้ใช้ไม่เห็น loading message)
+    # ถ้าว่างเปล่า → คืน [] (จะขึ้น loading message ครั้งแรกเท่านั้น)
+    if not _fetching:
         threading.Thread(target=_do_fetch, daemon=True).start()
-        return snapshot
+    return snapshot
 
-    # กรณีเพิ่งเริ่มระบบและยังไม่มีข้อมูลจริง ๆ
-    log.info('[cache] empty — starting background fetch')
-    threading.Thread(target=_do_fetch, daemon=True).start()
-    return []
+
+def cache_is_stale() -> bool:
+    """True ถ้า cache มีข้อมูลแต่หมดอายุแล้ว (กำลัง refresh อยู่)"""
+    with _cache_lock:
+        snapshot = list(_cache_data)
+        ts       = _cache_ts
+    return bool(snapshot) and (time.time() - ts) >= CACHE_TTL
+
+
+# ─── Text normalisation ───────────────────────────────────────────────────────
+def normalise_text(s: str) -> str:
+    """ตัดช่องว่างซ้ำ normalize ข้อความ (ไทย/อังกฤษ)"""
+    if not s:
+        return ''
+    return re.sub(r'\s+', ' ', s.strip())
 
 
 # ─── Thai month helpers ───────────────────────────────────────────────────────
@@ -229,30 +246,22 @@ def _sort(records: list) -> list:
     return sorted(records, key=lambda r: (-(r['year_be']), -(r['month_num'])))
 
 
-def _normalise_text(value: str) -> str:
-    """จัดรูปข้อความสำหรับค้นหา: ตัวพิมพ์เล็ก ตัดคำนำหน้า และรวมช่องว่างซ้ำ"""
-    value = str(value or '').strip().lower()
-    value = re.sub(r'\s+', ' ', value)
-    value = re.sub(r'^(นาย|นางสาว|นาง|ด\.ช\.|ด\.ญ\.|เด็กชาย|เด็กหญิง)\s*', '', value)
-    return value.strip()
-
-
 def search_name(kw: str, data: list):
-    query = _normalise_text(kw)
-    if not query:
-        return [], 0
+    """ค้นหาชื่อแบบ token-based:
+    - 'สร้อย'         → ทุก record ที่มี 'สร้อย' ในชื่อ/ชื่อเล่น
+    - 'สิทธิชัย สร้อย' → ต้องมีทั้ง 'สิทธิชัย' และ 'สร้อย' ในชื่อ/ชื่อเล่น
+    - รองรับช่องว่างซ้ำ เช่น 'สิทธิชัย  สร้อย'
+    """
+    kw_norm = normalise_text(kw).lower()
+    tokens  = kw_norm.split()  # แยกด้วย whitespace
 
-    tokens = [t for t in query.split(' ') if t]
-    hits = []
-    for r in data:
-        name = _normalise_text(r.get('name', ''))
-        nickname = _normalise_text(r.get('nickname', ''))
-        searchable = f'{name} {nickname}'.strip()
+    def matches(r: dict) -> bool:
+        name     = normalise_text(r.get('name', '') or '').lower()
+        nickname = normalise_text(r.get('nickname', '') or '').lower()
+        combined = name + ' ' + nickname
+        return all(tok in combined for tok in tokens)
 
-        # รองรับทั้งคำเต็มและคำบางส่วน เช่น "สิทธิชัย" หรือ "สร้อยสน"
-        if query in searchable or (tokens and all(token in searchable for token in tokens)):
-            hits.append(r)
-
+    hits = [r for r in data if matches(r)]
     return _sort(hits)[:DETAIL_LIMIT], len(hits)
 
 
@@ -376,6 +385,7 @@ def build_bubble(rec: dict) -> dict:
             'contents':body,
         },
     }
+    # แสดงรูปภาพผู้ต้องหา (จาก Google Drive)
     if image_url:
         bubble['hero'] = {
             'type':'image','url':image_url,
@@ -388,6 +398,44 @@ def build_carousel(records: list, alt: str) -> FlexMessage:
     bubbles   = [build_bubble(r) for r in records[:10]]
     container = {'type':'carousel','contents':bubbles} if len(bubbles) > 1 else bubbles[0]
     return FlexMessage(alt_text=alt, contents=FlexContainer.from_dict(container))
+
+
+def build_name_results(kw: str, rows: list, total: int) -> list:
+    """สร้าง message list สำหรับแสดงผลค้นหาชื่อ:
+    - header text (จำนวนที่พบ)
+    - Flex carousel (10 รายการแรกพร้อมรูปภาพ)
+    - text list (รายการที่ 11-30)
+    """
+    msgs = []
+
+    # Header
+    msgs.append(TextMessage(
+        text=f"🔍 ค้นหา: {kw}\nพบทั้งหมด {total} ราย (แสดง {len(rows)} ล่าสุด)"
+    ))
+
+    # Flex carousel (10 รายการแรก) พร้อมรูปภาพถ้ามี
+    if rows[:10]:
+        msgs.append(build_carousel(rows[:10], f"ค้นหา: {kw}"))
+
+    # Text list สำหรับรายการที่ 11-30
+    remaining = rows[10:30]
+    if remaining:
+        lines = [f"📋 รายชื่อเพิ่มเติม ({len(remaining)} ราย):"]
+        for i, r in enumerate(remaining, 11):
+            name       = r.get('name', '-')
+            charge     = (r.get('charge', '') or '')[:22]
+            month_abbr = r.get('month_abbr', '')
+            year_be    = r.get('year_be', '')
+            period     = f"{month_abbr} {year_be}".strip()
+            line       = f"{i}. {name}"
+            if charge:
+                line += f" — {charge}"
+            if period:
+                line += f" ({period})"
+            lines.append(line)
+        msgs.append(TextMessage(text='\n'.join(lines)))
+
+    return msgs
 
 
 def build_summary_flex(title: str, total: int, cat: dict, records: list) -> FlexMessage:
@@ -517,12 +565,12 @@ def _cat_count(rows: list) -> dict:
 
 
 def handle_message(text: str) -> list:
-    t = text.strip()
-    log.info(f'[message] text={t!r}')
     data = get_data()
-    log.info(f'[message] cache_records={len(data)}')
+    t    = normalise_text(text)  # normalize ก่อนเข้า logic ทั้งหมด
 
-    # ── ยังโหลดไม่เสร็จ ──
+    # ── ยังไม่มีข้อมูลเลย (ครั้งแรก) ──
+    # ถ้า data ว่าง = ยังไม่เคย load สำเร็จแม้แต่ครั้งเดียว
+    # ถ้า data มีข้อมูล (stale หรือใหม่) = ใช้ได้เลย ไม่ขึ้น loading message
     if not data:
         return [TextMessage(text=(
             "⏳ ระบบกำลังโหลดข้อมูลจาก Google Sheets\n"
@@ -556,15 +604,11 @@ def handle_message(text: str) -> list:
     # ── ค้นหาชื่อ ──
     m = re.match(r'^ค้นหา\s+(.+)$', t)
     if m:
-        kw = m.group(1).strip()
+        kw = normalise_text(m.group(1))
         rows, total = search_name(kw, data)
-        log.info(f'[search-name] query={kw!r} found={total}')
         if not rows:
             return [TextMessage(text=f"❌ ไม่พบ '{kw}' ในระบบ")]
-        return [
-            TextMessage(text=f"🔍 ค้นหา: {kw}\nพบทั้งหมด {total} ราย (แสดง {len(rows)} ล่าสุด)"),
-            build_carousel(rows[:10], f"ค้นหา: {kw}"),
-        ]
+        return build_name_results(kw, rows, total)
 
     # ── เดือน (explicit) ──
     m = re.match(r'^เดือน\s+(.+)$', t)
@@ -572,7 +616,6 @@ def handle_message(text: str) -> list:
         mn, yr = parse_month_year(m.group(1))
         if mn and yr:
             rows = monthly(mn, yr, data)
-            log.info(f'[month] month={mn} year={yr} found={len(rows)}')
             if not rows:
                 return [TextMessage(text="❌ ไม่พบข้อมูลเดือนนั้น")]
             abbr = MONTH_NUM_TO_ABBR.get(mn, '')
@@ -584,7 +627,6 @@ def handle_message(text: str) -> list:
         mn, yr = parse_month_year(t)
         if mn and yr:
             rows = monthly(mn, yr, data)
-            log.info(f'[month-direct] month={mn} year={yr} found={len(rows)}')
             if not rows:
                 return [TextMessage(text="❌ ไม่พบข้อมูลเดือนนั้น")]
             abbr = MONTH_NUM_TO_ABBR.get(mn, '')
@@ -603,7 +645,7 @@ def handle_message(text: str) -> list:
     # ── สถานที่ (explicit) ──
     m = re.match(r'^สถานที่\s+(.+)$', t)
     if m:
-        kw = m.group(1).strip()
+        kw = normalise_text(m.group(1))
         rows, total = search_location(kw, data)
         if not rows:
             return [TextMessage(text=f"❌ ไม่พบสถานที่ '{kw}'")]
@@ -618,7 +660,7 @@ def handle_message(text: str) -> list:
     # ── ของกลาง ──
     m = re.match(r'^ของกลาง\s+(.+)$', t)
     if m:
-        kw = m.group(1).strip()
+        kw = normalise_text(m.group(1))
         rows, total = search_evidence(kw, data)
         if not rows:
             return [TextMessage(text=f"❌ ไม่พบของกลาง '{kw}'")]
@@ -630,21 +672,18 @@ def handle_message(text: str) -> list:
     # ── ข้อหา ──
     m = re.match(r'^ข้อหา\s+(.+)$', t)
     if m:
-        kw = m.group(1).strip()
+        kw = normalise_text(m.group(1))
         rows, total = search_charge(kw, data)
         if not rows:
             return [TextMessage(text=f"❌ ไม่พบข้อหา '{kw}'")]
         return [build_summary_flex(f"⚖️ {kw}", total, _cat_count(rows), rows)]
 
-    # ── fallback: ลองค้นหาชื่อ (รองรับพิมพ์ชื่อตรงๆ ไม่ต้องมีคำนำหน้า) ──
+    # ── fallback: ค้นหาชื่อ (พิมพ์ตรงๆ ไม่ต้องมีคำนำหน้า) ──
+    # รองรับ: 'สิทธิชัย', 'สร้อย', 'สร้อยสน', 'สิทธิชัย สร้อย'
     if len(t) >= 2:
         rows, total = search_name(t, data)
-        log.info(f'[search-name-fallback] query={t!r} found={total}')
         if rows:
-            return [
-                TextMessage(text=f"🔍 ค้นหา: {t}\nพบทั้งหมด {total} ราย (แสดง {len(rows)} ล่าสุด)"),
-                build_carousel(rows[:10], f"ค้นหา: {t}"),
-            ]
+            return build_name_results(t, rows, total)
 
     return [TextMessage(text=f"❓ ไม่พบ '{t}' ในระบบ\nพิมพ์ bot ช่วยเหลือ เพื่อดูคำสั่งทั้งหมด")]
 
@@ -758,37 +797,50 @@ def http_refresh():
 
 @app.route('/')
 def index():
-    n   = len(_cache_data)
-    age = int(time.time() - _cache_ts) if _cache_ts else -1
-    return f'LINE Bot สน.บางชัน v4 | {n} records | cache age {age}s', 200
+    n    = len(_cache_data)
+    age  = int(time.time() - _cache_ts) if _cache_ts else -1
+    stale = ' (stale — refreshing)' if cache_is_stale() else ''
+    return f'LINE Bot สน.บางชัน v4.1 | {n} records | cache age {age}s{stale}', 200
 
 
 @app.route('/debug')
 def debug():
-    """แสดงสถานะ cache โดยไม่ดาวน์โหลด JSON ทั้งชุดซ้ำ เพื่อลดการใช้ RAM บน Render Free"""
-    with _cache_lock:
-        snapshot = list(_cache_data)
-        ts = _cache_ts
+    """ทดสอบการเชื่อมต่อ Apps Script และแสดง raw response"""
+    try:
+        params = {'key': APPS_SCRIPT_KEY} if APPS_SCRIPT_KEY else {}
+        resp   = requests.get(
+            APPS_SCRIPT_URL, params=params,
+            timeout=FETCH_TIMEOUT, allow_redirects=True
+        )
+        ct      = resp.headers.get('Content-Type', '')
+        preview = resp.text[:500]
+        try:
+            payload  = resp.json()
+            n_rec    = len(payload.get('records', []))
+            sheets   = payload.get('sheetsProcessed', '?')
+            err_msg  = payload.get('error', None)
+            status   = f'OK — {n_rec} records, {sheets} sheets'
+            if err_msg:
+                status = f'ERROR: {err_msg}'
+        except Exception:
+            n_rec  = 0
+            status = 'JSON parse failed'
 
-    age = int(time.time() - ts) if ts else -1
-    years = sorted({r.get('year_be', 0) for r in snapshot if r.get('year_be')}, reverse=True)[:10]
-    periods = sorted({(r.get('year_be', 0), r.get('month_num', 0)) for r in snapshot if r.get('year_be') and r.get('month_num')}, reverse=True)[:12]
-    sample_names = [r.get('name', '') for r in snapshot[:5]]
-
-    lines = [
-        '=== Debug: LINE Bot Cache ===',
-        f'Cache records: {len(snapshot)}',
-        f'Cache age: {age}s',
-        f'Fetching: {_fetching}',
-        f'Cache TTL: {CACHE_TTL}s',
-        f'Fetch timeout: {FETCH_TIMEOUT}s',
-        f'Years (latest): {years}',
-        f'Periods (latest): {periods}',
-        f'Sample names: {sample_names}',
-        '',
-        'หมายเหตุ: หน้า debug รุ่น 4.1 ไม่เรียก Apps Script ซ้ำ เพื่อป้องกันหน่วยความจำเต็ม',
-    ]
-    return '\n'.join(lines), 200, {'Content-Type': 'text/plain; charset=utf-8'}
+        lines = [
+            '=== Debug: Apps Script ===',
+            f'URL: {resp.url[:100]}',
+            f'HTTP: {resp.status_code}',
+            f'Content-Type: {ct}',
+            f'Apps Script status: {status}',
+            f'Cache: {len(_cache_data)} records, age {int(time.time()-_cache_ts) if _cache_ts else -1}s',
+            f'Fetching: {_fetching}',
+            '',
+            '--- Response preview (first 500 chars) ---',
+            preview,
+        ]
+        return '\n'.join(lines), 200, {'Content-Type': 'text/plain; charset=utf-8'}
+    except Exception as e:
+        return f'debug error: {e}', 500
 
 
 # ─── Startup preload ──────────────────────────────────────────────────────────
