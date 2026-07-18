@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 LINE Bot — ระบบสืบค้นผลการจับกุม สน.บางชัน
-v4.0 — Apps Script Edition (ไม่ต้องใช้ Service Account)
+v4.1 — Apps Script Edition (ปรับ cache / search / logging)
 ดึงข้อมูลจาก Google Apps Script Web App → cache ใน RAM → ตอบ Flex Message
 """
 
@@ -135,26 +135,35 @@ def _do_fetch():
 
 
 def get_data(force: bool = False) -> list:
-    """คืน cached data ทันที — ไม่ block webhook handler เด็ดขาด"""
+    """ใช้ cache แบบ stale-while-revalidate: มีข้อมูลเก่าให้ตอบก่อน แล้วค่อยอัปเดตเบื้องหลัง"""
     global _cache_data, _cache_ts
     with _cache_lock:
         snapshot = list(_cache_data)
         ts       = _cache_ts
 
-    cache_valid = bool(snapshot) and (time.time() - ts) < CACHE_TTL
+    age = time.time() - ts if ts else -1
+    cache_valid = bool(snapshot) and age < CACHE_TTL
 
     if force:
-        # /refresh endpoint: รอ fetch จริง (ไม่ใช่ webhook path)
+        log.info('[cache] force refresh requested')
         _do_fetch()
         with _cache_lock:
             return list(_cache_data)
 
     if cache_valid:
+        log.info(f'[cache] hit records={len(snapshot)} age={int(age)}s')
         return snapshot
 
-    # Cache หมดอายุหรือว่างเปล่า → kick background fetch แล้วคืนทันที
+    # ถ้ามี cache เก่า ให้ตอบจากข้อมูลเดิมทันทีและรีเฟรชเบื้องหลัง
+    if snapshot:
+        log.info(f'[cache] stale records={len(snapshot)} age={int(age)}s — refreshing in background')
+        threading.Thread(target=_do_fetch, daemon=True).start()
+        return snapshot
+
+    # กรณีเพิ่งเริ่มระบบและยังไม่มีข้อมูลจริง ๆ
+    log.info('[cache] empty — starting background fetch')
     threading.Thread(target=_do_fetch, daemon=True).start()
-    return snapshot  # [] ถ้ายังไม่เคย load
+    return []
 
 
 # ─── Thai month helpers ───────────────────────────────────────────────────────
@@ -220,9 +229,30 @@ def _sort(records: list) -> list:
     return sorted(records, key=lambda r: (-(r['year_be']), -(r['month_num'])))
 
 
+def _normalise_text(value: str) -> str:
+    """จัดรูปข้อความสำหรับค้นหา: ตัวพิมพ์เล็ก ตัดคำนำหน้า และรวมช่องว่างซ้ำ"""
+    value = str(value or '').strip().lower()
+    value = re.sub(r'\s+', ' ', value)
+    value = re.sub(r'^(นาย|นางสาว|นาง|ด\.ช\.|ด\.ญ\.|เด็กชาย|เด็กหญิง)\s*', '', value)
+    return value.strip()
+
+
 def search_name(kw: str, data: list):
-    kw_l = kw.lower()
-    hits  = [r for r in data if kw_l in r['name'].lower()]
+    query = _normalise_text(kw)
+    if not query:
+        return [], 0
+
+    tokens = [t for t in query.split(' ') if t]
+    hits = []
+    for r in data:
+        name = _normalise_text(r.get('name', ''))
+        nickname = _normalise_text(r.get('nickname', ''))
+        searchable = f'{name} {nickname}'.strip()
+
+        # รองรับทั้งคำเต็มและคำบางส่วน เช่น "สิทธิชัย" หรือ "สร้อยสน"
+        if query in searchable or (tokens and all(token in searchable for token in tokens)):
+            hits.append(r)
+
     return _sort(hits)[:DETAIL_LIMIT], len(hits)
 
 
@@ -487,8 +517,10 @@ def _cat_count(rows: list) -> dict:
 
 
 def handle_message(text: str) -> list:
+    t = text.strip()
+    log.info(f'[message] text={t!r}')
     data = get_data()
-    t    = text.strip()
+    log.info(f'[message] cache_records={len(data)}')
 
     # ── ยังโหลดไม่เสร็จ ──
     if not data:
@@ -526,6 +558,7 @@ def handle_message(text: str) -> list:
     if m:
         kw = m.group(1).strip()
         rows, total = search_name(kw, data)
+        log.info(f'[search-name] query={kw!r} found={total}')
         if not rows:
             return [TextMessage(text=f"❌ ไม่พบ '{kw}' ในระบบ")]
         return [
@@ -539,6 +572,7 @@ def handle_message(text: str) -> list:
         mn, yr = parse_month_year(m.group(1))
         if mn and yr:
             rows = monthly(mn, yr, data)
+            log.info(f'[month] month={mn} year={yr} found={len(rows)}')
             if not rows:
                 return [TextMessage(text="❌ ไม่พบข้อมูลเดือนนั้น")]
             abbr = MONTH_NUM_TO_ABBR.get(mn, '')
@@ -550,6 +584,7 @@ def handle_message(text: str) -> list:
         mn, yr = parse_month_year(t)
         if mn and yr:
             rows = monthly(mn, yr, data)
+            log.info(f'[month-direct] month={mn} year={yr} found={len(rows)}')
             if not rows:
                 return [TextMessage(text="❌ ไม่พบข้อมูลเดือนนั้น")]
             abbr = MONTH_NUM_TO_ABBR.get(mn, '')
@@ -604,6 +639,7 @@ def handle_message(text: str) -> list:
     # ── fallback: ลองค้นหาชื่อ (รองรับพิมพ์ชื่อตรงๆ ไม่ต้องมีคำนำหน้า) ──
     if len(t) >= 2:
         rows, total = search_name(t, data)
+        log.info(f'[search-name-fallback] query={t!r} found={total}')
         if rows:
             return [
                 TextMessage(text=f"🔍 ค้นหา: {t}\nพบทั้งหมด {total} ราย (แสดง {len(rows)} ล่าสุด)"),
@@ -729,42 +765,30 @@ def index():
 
 @app.route('/debug')
 def debug():
-    """ทดสอบการเชื่อมต่อ Apps Script และแสดง raw response"""
-    import json as _json
-    try:
-        params = {'key': APPS_SCRIPT_KEY} if APPS_SCRIPT_KEY else {}
-        resp   = requests.get(
-            APPS_SCRIPT_URL, params=params,
-            timeout=FETCH_TIMEOUT, allow_redirects=True
-        )
-        ct      = resp.headers.get('Content-Type', '')
-        preview = resp.text[:500]
-        try:
-            payload  = resp.json()
-            n_rec    = len(payload.get('records', []))
-            sheets   = payload.get('sheetsProcessed', '?')
-            err_msg  = payload.get('error', None)
-            status   = f'OK — {n_rec} records, {sheets} sheets'
-            if err_msg:
-                status = f'ERROR: {err_msg}'
-        except Exception:
-            n_rec  = 0
-            status = 'JSON parse failed'
+    """แสดงสถานะ cache โดยไม่ดาวน์โหลด JSON ทั้งชุดซ้ำ เพื่อลดการใช้ RAM บน Render Free"""
+    with _cache_lock:
+        snapshot = list(_cache_data)
+        ts = _cache_ts
 
-        lines = [
-            f'=== Debug: Apps Script ===',
-            f'URL: {resp.url[:100]}',
-            f'HTTP: {resp.status_code}',
-            f'Content-Type: {ct}',
-            f'Apps Script status: {status}',
-            f'Cache: {len(_cache_data)} records, age {int(time.time()-_cache_ts) if _cache_ts else -1}s',
-            f'',
-            f'--- Response preview (first 500 chars) ---',
-            preview,
-        ]
-        return '\n'.join(lines), 200, {'Content-Type': 'text/plain; charset=utf-8'}
-    except Exception as e:
-        return f'debug error: {e}', 500
+    age = int(time.time() - ts) if ts else -1
+    years = sorted({r.get('year_be', 0) for r in snapshot if r.get('year_be')}, reverse=True)[:10]
+    periods = sorted({(r.get('year_be', 0), r.get('month_num', 0)) for r in snapshot if r.get('year_be') and r.get('month_num')}, reverse=True)[:12]
+    sample_names = [r.get('name', '') for r in snapshot[:5]]
+
+    lines = [
+        '=== Debug: LINE Bot Cache ===',
+        f'Cache records: {len(snapshot)}',
+        f'Cache age: {age}s',
+        f'Fetching: {_fetching}',
+        f'Cache TTL: {CACHE_TTL}s',
+        f'Fetch timeout: {FETCH_TIMEOUT}s',
+        f'Years (latest): {years}',
+        f'Periods (latest): {periods}',
+        f'Sample names: {sample_names}',
+        '',
+        'หมายเหตุ: หน้า debug รุ่น 4.1 ไม่เรียก Apps Script ซ้ำ เพื่อป้องกันหน่วยความจำเต็ม',
+    ]
+    return '\n'.join(lines), 200, {'Content-Type': 'text/plain; charset=utf-8'}
 
 
 # ─── Startup preload ──────────────────────────────────────────────────────────
