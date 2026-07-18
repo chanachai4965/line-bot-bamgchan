@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 LINE Bot — ระบบสืบค้นผลการจับกุม สน.บางชัน
-v6.3 — แสดงผู้ควบคุมชุดใน ชป. และไม่รวมในเวร
+v6.4 — จับคู่สมาชิกชุดด้วยชื่อเมื่อเบอร์โทรไม่ตรง
 ดึงข้อมูลจาก Google Apps Script Web App → cache ใน RAM → ตอบ Flex Message
 """
 
@@ -1341,7 +1341,7 @@ def index():
         staff_n = len(_staff_data)
         staff_age = int(time.time() - _staff_ts) if _staff_ts else -1
     return (
-        f'LINE Bot สน.บางชัน v6.3 | arrests {arrest_n} age {arrest_age}s | '
+        f'LINE Bot สน.บางชัน v6.4 | arrests {arrest_n} age {arrest_age}s | '
         f'staff {staff_n} age {staff_age}s'
     ), 200
 
