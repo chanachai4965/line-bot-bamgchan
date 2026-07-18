@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
 LINE Bot — ระบบสืบค้นผลการจับกุม สน.บางชัน
-v4.1 — Apps Script Edition
-- Cache: คืน stale data ทันที, ไม่ขึ้น "⏳" ถ้ายังมี cache เก่า
-- Search: token-based matching, normalise whitespace, ค้นจากชื่อเล่นด้วย
-- Cards: 10 รายการแรก → Flex carousel, รายการที่ 11-30 → text list
+v4.0 — Apps Script Edition (ไม่ต้องใช้ Service Account)
+ดึงข้อมูลจาก Google Apps Script Web App → cache ใน RAM → ตอบ Flex Message
 """
 
 import os
@@ -42,7 +40,7 @@ LINE_CHANNEL_ACCESS_TOKEN  = os.environ['LINE_CHANNEL_ACCESS_TOKEN']
 APPS_SCRIPT_URL            = os.environ['APPS_SCRIPT_URL']
 # Secret key สำหรับป้องกัน Apps Script ถูกเรียกโดยคนอื่น (ต้องตรงกับ Code.gs)
 APPS_SCRIPT_KEY            = os.environ.get('APPS_SCRIPT_KEY', '')
-CACHE_TTL                  = int(os.environ.get('CACHE_TTL', '300'))    # วินาที
+CACHE_TTL                  = int(os.environ.get('CACHE_TTL', '300'))   # วินาที
 FETCH_TIMEOUT              = int(os.environ.get('FETCH_TIMEOUT', '90')) # วินาที
 DETAIL_LIMIT               = 30
 
@@ -50,10 +48,13 @@ configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler       = WebhookHandler(LINE_CHANNEL_SECRET)
 
 # ─── Data cache ───────────────────────────────────────────────────────────────
+# ห้ามเริ่ม background thread ตอน import module:
+# Gunicorn อาจ import ใน master process ก่อน fork worker ทำให้ cache อยู่ผิด process
 _cache_data: list  = []
 _cache_ts:   float = 0.0
-_cache_lock        = threading.Lock()
-_fetching:   bool  = False   # True = background fetch กำลังทำงานอยู่
+_cache_lock        = threading.RLock()
+_fetch_state_lock  = threading.Lock()
+_fetching:   bool  = False
 
 
 def fetch_all() -> list:
@@ -70,7 +71,7 @@ def fetch_all() -> list:
         # ตรวจสอบว่า response เป็น JSON จริง ไม่ใช่ HTML error page
         ct = resp.headers.get('Content-Type', '')
         if 'html' in ct:
-            log.error('[fetch] got HTML instead of JSON — Apps Script may need authorization')
+            log.error(f'[fetch] got HTML instead of JSON — Apps Script may need authorization')
             log.error(f'[fetch] first 300 chars: {resp.text[:300]}')
             return _cache_data
 
@@ -81,7 +82,7 @@ def fetch_all() -> list:
             err = payload['error']
             log.error(f'[fetch] Apps Script returned error: {err}')
             if err == 'Unauthorized':
-                log.error('[fetch] ❌ KEY ไม่ตรง — ตรวจสอบ APPS_SCRIPT_KEY และ SECRET_KEY ใน Code.gs')
+                log.error(f'[fetch] ❌ KEY ไม่ตรง — ตรวจสอบ APPS_SCRIPT_KEY และ SECRET_KEY ใน Code.gs')
             return _cache_data
 
         raw_records: list = payload.get('records', [])
@@ -121,66 +122,81 @@ def _normalise(r: dict) -> dict:
 
 
 def _do_fetch():
-    """Fetch data in background — อัปเดต cache โดยไม่ block webhook handler"""
-    global _cache_data, _cache_ts, _fetching
-    if _fetching:
-        return  # ถ้า fetch อยู่แล้ว ไม่ต้อง fetch ซ้ำ
-    _fetching = True
+    """โหลดข้อมูลและอัปเดต cache ภายใน worker process ที่รับ request จริง"""
+    global _cache_ts, _fetching
+
+    with _fetch_state_lock:
+        if _fetching:
+            log.info('[cache] fetch already running')
+            return
+        _fetching = True
+
     try:
         fresh = fetch_all()
-        with _cache_lock:
-            if fresh:
-                _cache_data = fresh
-                _cache_ts   = time.time()
+        if fresh:
+            with _cache_lock:
+                _cache_data.clear()
+                _cache_data.extend(fresh)
+                _cache_ts = time.time()
+                count = len(_cache_data)
+            log.info(f'[cache] updated records={count}')
+        else:
+            with _cache_lock:
+                count = len(_cache_data)
+            log.warning(f'[cache] fetch returned no data; keeping records={count}')
     finally:
-        _fetching = False
+        with _fetch_state_lock:
+            _fetching = False
+
+
+def _start_fetch_background() -> bool:
+    """เริ่ม fetch ใน background หากยังไม่มีงาน fetch อยู่"""
+    with _fetch_state_lock:
+        if _fetching:
+            return False
+
+    threading.Thread(
+        target=_do_fetch,
+        name='apps-script-fetch',
+        daemon=True
+    ).start()
+    return True
 
 
 def get_data(force: bool = False) -> list:
-    """คืน cached data ทันที — ไม่ block webhook handler เด็ดขาด
-    - cache ว่างเปล่า (ครั้งแรก): เริ่ม fetch + คืน []
-    - cache มีข้อมูลและยังใหม่: คืนทันที
-    - cache มีข้อมูลแต่หมดอายุ: เริ่ม background refresh + คืน stale data ทันที
-      (ไม่แสดง ⏳ loading message กับผู้ใช้)
     """
-    global _cache_data, _cache_ts
+    คืน cache แบบ stale-while-revalidate:
+    - มี cache แม้หมดอายุ: ใช้ตอบทันที แล้ว refresh เบื้องหลัง
+    - cache ว่าง: เริ่มโหลดเบื้องหลังและคืน []
+    """
     with _cache_lock:
         snapshot = list(_cache_data)
-        ts       = _cache_ts
+        ts = _cache_ts
 
-    cache_valid = bool(snapshot) and (time.time() - ts) < CACHE_TTL
+    age = (time.time() - ts) if ts else None
+    cache_expired = bool(snapshot) and age is not None and age >= CACHE_TTL
 
     if force:
-        # /refresh endpoint: รอ fetch จริง (ไม่ใช่ webhook path)
         _do_fetch()
         with _cache_lock:
-            return list(_cache_data)
+            result = list(_cache_data)
+        log.info(f'[cache] force result={len(result)}')
+        return result
 
-    if cache_valid:
+    if snapshot:
+        if cache_expired:
+            started = _start_fetch_background()
+            log.info(
+                f'[cache] stale records={len(snapshot)} age={int(age)}s '
+                f'refresh_started={started}'
+            )
+        else:
+            log.info(f'[cache] hit records={len(snapshot)} age={int(age or 0)}s')
         return snapshot
 
-    # Cache หมดอายุหรือว่างเปล่า → เริ่ม background fetch แล้วคืนทันที
-    # ถ้ามี stale data → คืน stale data (ผู้ใช้ไม่เห็น loading message)
-    # ถ้าว่างเปล่า → คืน [] (จะขึ้น loading message ครั้งแรกเท่านั้น)
-    if not _fetching:
-        threading.Thread(target=_do_fetch, daemon=True).start()
-    return snapshot
-
-
-def cache_is_stale() -> bool:
-    """True ถ้า cache มีข้อมูลแต่หมดอายุแล้ว (กำลัง refresh อยู่)"""
-    with _cache_lock:
-        snapshot = list(_cache_data)
-        ts       = _cache_ts
-    return bool(snapshot) and (time.time() - ts) >= CACHE_TTL
-
-
-# ─── Text normalisation ───────────────────────────────────────────────────────
-def normalise_text(s: str) -> str:
-    """ตัดช่องว่างซ้ำ normalize ข้อความ (ไทย/อังกฤษ)"""
-    if not s:
-        return ''
-    return re.sub(r'\s+', ' ', s.strip())
+    started = _start_fetch_background()
+    log.info(f'[cache] empty - background_started={started}')
+    return []
 
 
 # ─── Thai month helpers ───────────────────────────────────────────────────────
@@ -247,21 +263,8 @@ def _sort(records: list) -> list:
 
 
 def search_name(kw: str, data: list):
-    """ค้นหาชื่อแบบ token-based:
-    - 'สร้อย'         → ทุก record ที่มี 'สร้อย' ในชื่อ/ชื่อเล่น
-    - 'สิทธิชัย สร้อย' → ต้องมีทั้ง 'สิทธิชัย' และ 'สร้อย' ในชื่อ/ชื่อเล่น
-    - รองรับช่องว่างซ้ำ เช่น 'สิทธิชัย  สร้อย'
-    """
-    kw_norm = normalise_text(kw).lower()
-    tokens  = kw_norm.split()  # แยกด้วย whitespace
-
-    def matches(r: dict) -> bool:
-        name     = normalise_text(r.get('name', '') or '').lower()
-        nickname = normalise_text(r.get('nickname', '') or '').lower()
-        combined = name + ' ' + nickname
-        return all(tok in combined for tok in tokens)
-
-    hits = [r for r in data if matches(r)]
+    kw_l = kw.lower()
+    hits  = [r for r in data if kw_l in r['name'].lower()]
     return _sort(hits)[:DETAIL_LIMIT], len(hits)
 
 
@@ -385,7 +388,6 @@ def build_bubble(rec: dict) -> dict:
             'contents':body,
         },
     }
-    # แสดงรูปภาพผู้ต้องหา (จาก Google Drive)
     if image_url:
         bubble['hero'] = {
             'type':'image','url':image_url,
@@ -398,44 +400,6 @@ def build_carousel(records: list, alt: str) -> FlexMessage:
     bubbles   = [build_bubble(r) for r in records[:10]]
     container = {'type':'carousel','contents':bubbles} if len(bubbles) > 1 else bubbles[0]
     return FlexMessage(alt_text=alt, contents=FlexContainer.from_dict(container))
-
-
-def build_name_results(kw: str, rows: list, total: int) -> list:
-    """สร้าง message list สำหรับแสดงผลค้นหาชื่อ:
-    - header text (จำนวนที่พบ)
-    - Flex carousel (10 รายการแรกพร้อมรูปภาพ)
-    - text list (รายการที่ 11-30)
-    """
-    msgs = []
-
-    # Header
-    msgs.append(TextMessage(
-        text=f"🔍 ค้นหา: {kw}\nพบทั้งหมด {total} ราย (แสดง {len(rows)} ล่าสุด)"
-    ))
-
-    # Flex carousel (10 รายการแรก) พร้อมรูปภาพถ้ามี
-    if rows[:10]:
-        msgs.append(build_carousel(rows[:10], f"ค้นหา: {kw}"))
-
-    # Text list สำหรับรายการที่ 11-30
-    remaining = rows[10:30]
-    if remaining:
-        lines = [f"📋 รายชื่อเพิ่มเติม ({len(remaining)} ราย):"]
-        for i, r in enumerate(remaining, 11):
-            name       = r.get('name', '-')
-            charge     = (r.get('charge', '') or '')[:22]
-            month_abbr = r.get('month_abbr', '')
-            year_be    = r.get('year_be', '')
-            period     = f"{month_abbr} {year_be}".strip()
-            line       = f"{i}. {name}"
-            if charge:
-                line += f" — {charge}"
-            if period:
-                line += f" ({period})"
-            lines.append(line)
-        msgs.append(TextMessage(text='\n'.join(lines)))
-
-    return msgs
 
 
 def build_summary_flex(title: str, total: int, cat: dict, records: list) -> FlexMessage:
@@ -565,12 +529,12 @@ def _cat_count(rows: list) -> dict:
 
 
 def handle_message(text: str) -> list:
+    t = text.strip()
+    log.info(f'[message] text={t!r}')
     data = get_data()
-    t    = normalise_text(text)  # normalize ก่อนเข้า logic ทั้งหมด
+    log.info(f'[message] cache_records={len(data)}')
 
-    # ── ยังไม่มีข้อมูลเลย (ครั้งแรก) ──
-    # ถ้า data ว่าง = ยังไม่เคย load สำเร็จแม้แต่ครั้งเดียว
-    # ถ้า data มีข้อมูล (stale หรือใหม่) = ใช้ได้เลย ไม่ขึ้น loading message
+    # ── ยังโหลดไม่เสร็จ ──
     if not data:
         return [TextMessage(text=(
             "⏳ ระบบกำลังโหลดข้อมูลจาก Google Sheets\n"
@@ -604,11 +568,14 @@ def handle_message(text: str) -> list:
     # ── ค้นหาชื่อ ──
     m = re.match(r'^ค้นหา\s+(.+)$', t)
     if m:
-        kw = normalise_text(m.group(1))
+        kw = m.group(1).strip()
         rows, total = search_name(kw, data)
         if not rows:
             return [TextMessage(text=f"❌ ไม่พบ '{kw}' ในระบบ")]
-        return build_name_results(kw, rows, total)
+        return [
+            TextMessage(text=f"🔍 ค้นหา: {kw}\nพบทั้งหมด {total} ราย (แสดง {len(rows)} ล่าสุด)"),
+            build_carousel(rows[:10], f"ค้นหา: {kw}"),
+        ]
 
     # ── เดือน (explicit) ──
     m = re.match(r'^เดือน\s+(.+)$', t)
@@ -645,7 +612,7 @@ def handle_message(text: str) -> list:
     # ── สถานที่ (explicit) ──
     m = re.match(r'^สถานที่\s+(.+)$', t)
     if m:
-        kw = normalise_text(m.group(1))
+        kw = m.group(1).strip()
         rows, total = search_location(kw, data)
         if not rows:
             return [TextMessage(text=f"❌ ไม่พบสถานที่ '{kw}'")]
@@ -660,7 +627,7 @@ def handle_message(text: str) -> list:
     # ── ของกลาง ──
     m = re.match(r'^ของกลาง\s+(.+)$', t)
     if m:
-        kw = normalise_text(m.group(1))
+        kw = m.group(1).strip()
         rows, total = search_evidence(kw, data)
         if not rows:
             return [TextMessage(text=f"❌ ไม่พบของกลาง '{kw}'")]
@@ -672,18 +639,20 @@ def handle_message(text: str) -> list:
     # ── ข้อหา ──
     m = re.match(r'^ข้อหา\s+(.+)$', t)
     if m:
-        kw = normalise_text(m.group(1))
+        kw = m.group(1).strip()
         rows, total = search_charge(kw, data)
         if not rows:
             return [TextMessage(text=f"❌ ไม่พบข้อหา '{kw}'")]
         return [build_summary_flex(f"⚖️ {kw}", total, _cat_count(rows), rows)]
 
-    # ── fallback: ค้นหาชื่อ (พิมพ์ตรงๆ ไม่ต้องมีคำนำหน้า) ──
-    # รองรับ: 'สิทธิชัย', 'สร้อย', 'สร้อยสน', 'สิทธิชัย สร้อย'
+    # ── fallback: ลองค้นหาชื่อ (รองรับพิมพ์ชื่อตรงๆ ไม่ต้องมีคำนำหน้า) ──
     if len(t) >= 2:
         rows, total = search_name(t, data)
         if rows:
-            return build_name_results(t, rows, total)
+            return [
+                TextMessage(text=f"🔍 ค้นหา: {t}\nพบทั้งหมด {total} ราย (แสดง {len(rows)} ล่าสุด)"),
+                build_carousel(rows[:10], f"ค้นหา: {t}"),
+            ]
 
     return [TextMessage(text=f"❓ ไม่พบ '{t}' ในระบบ\nพิมพ์ bot ช่วยเหลือ เพื่อดูคำสั่งทั้งหมด")]
 
@@ -773,6 +742,10 @@ def on_unfollow(_event):
 # ─── Flask routes ─────────────────────────────────────────────────────────────
 @app.route('/callback', methods=['POST'])
 def callback():
+    # ทำงานใน worker process จริง จึงใช้เริ่ม cache loader ได้อย่างปลอดภัย
+    if not _cache_data:
+        _start_fetch_background()
+
     sig  = request.headers.get('X-Line-Signature','')
     body = request.get_data(as_text=True)
     try:
@@ -797,15 +770,21 @@ def http_refresh():
 
 @app.route('/')
 def index():
-    n    = len(_cache_data)
-    age  = int(time.time() - _cache_ts) if _cache_ts else -1
-    stale = ' (stale — refreshing)' if cache_is_stale() else ''
-    return f'LINE Bot สน.บางชัน v4.1 | {n} records | cache age {age}s{stale}', 200
+    # Render เรียกหน้า / หลัง worker พร้อมใช้งาน จึงใช้จุดนี้ preload cache
+    if not _cache_data:
+        _start_fetch_background()
+
+    with _cache_lock:
+        n = len(_cache_data)
+        ts = _cache_ts
+    age = int(time.time() - ts) if ts else -1
+    return f'LINE Bot สน.บางชัน v4.2 | {n} records | cache age {age}s', 200
 
 
 @app.route('/debug')
 def debug():
     """ทดสอบการเชื่อมต่อ Apps Script และแสดง raw response"""
+    import json as _json
     try:
         params = {'key': APPS_SCRIPT_KEY} if APPS_SCRIPT_KEY else {}
         resp   = requests.get(
@@ -827,15 +806,14 @@ def debug():
             status = 'JSON parse failed'
 
         lines = [
-            '=== Debug: Apps Script ===',
+            f'=== Debug: Apps Script ===',
             f'URL: {resp.url[:100]}',
             f'HTTP: {resp.status_code}',
             f'Content-Type: {ct}',
             f'Apps Script status: {status}',
             f'Cache: {len(_cache_data)} records, age {int(time.time()-_cache_ts) if _cache_ts else -1}s',
-            f'Fetching: {_fetching}',
-            '',
-            '--- Response preview (first 500 chars) ---',
+            f'',
+            f'--- Response preview (first 500 chars) ---',
             preview,
         ]
         return '\n'.join(lines), 200, {'Content-Type': 'text/plain; charset=utf-8'}
@@ -844,8 +822,8 @@ def debug():
 
 
 # ─── Startup preload ──────────────────────────────────────────────────────────
-# ทำงานตอน gunicorn import module — ไม่ใช้ if __name__ เพราะ gunicorn ไม่รัน block นั้น
-threading.Thread(target=_do_fetch, daemon=True).start()
+# ไม่เริ่ม thread ตอน import เพราะ Gunicorn อาจ import ใน master ก่อน fork worker
+# การ preload จะเริ่มจาก route / หรือ /callback ซึ่งทำงานใน worker processจริง
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
