@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 LINE Bot — ระบบสืบค้นผลการจับกุม สน.บางชัน
-v4.3 — Apps Script Edition (แสดงรูปภาพ + รายการต่อเนื่อง)
+v5.0 — เพิ่มฐานข้อมูลบุคลากร ชุดปฏิบัติการ และเวรวันคู่/วันคี่
 ดึงข้อมูลจาก Google Apps Script Web App → cache ใน RAM → ตอบ Flex Message
 """
 
@@ -10,6 +10,8 @@ import re
 import time
 import logging
 import threading
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 import requests
@@ -50,15 +52,16 @@ handler       = WebhookHandler(LINE_CHANNEL_SECRET)
 # ─── Data cache ───────────────────────────────────────────────────────────────
 # ห้ามเริ่ม background thread ตอน import module:
 # Gunicorn อาจ import ใน master process ก่อน fork worker ทำให้ cache อยู่ผิด process
-_cache_data: list  = []
-_cache_ts:   float = 0.0
+_cache_data:  list = []
+_staff_data: list = []
+_cache_ts:  float = 0.0
 _cache_lock        = threading.RLock()
 _fetch_state_lock  = threading.Lock()
 _fetching:   bool  = False
 
 
-def fetch_all() -> list:
-    """เรียก Apps Script Web App → คืน list ของ record dict (snake_case)"""
+def fetch_all() -> tuple[list, list]:
+    """เรียก Apps Script → คืน (ข้อมูลจับกุม, ข้อมูลบุคลากร)"""
     try:
         params = {'key': APPS_SCRIPT_KEY} if APPS_SCRIPT_KEY else {}
         log.info(f'[fetch] GET {APPS_SCRIPT_URL} key={bool(APPS_SCRIPT_KEY)}')
@@ -68,42 +71,41 @@ def fetch_all() -> list:
         )
         log.info(f'[fetch] HTTP {resp.status_code} url={resp.url[:80]}')
 
-        # ตรวจสอบว่า response เป็น JSON จริง ไม่ใช่ HTML error page
         ct = resp.headers.get('Content-Type', '')
         if 'html' in ct:
-            log.error(f'[fetch] got HTML instead of JSON — Apps Script may need authorization')
+            log.error('[fetch] got HTML instead of JSON')
             log.error(f'[fetch] first 300 chars: {resp.text[:300]}')
-            return _cache_data
+            return list(_cache_data), list(_staff_data)
 
         resp.raise_for_status()
         payload = resp.json()
 
         if 'error' in payload:
-            err = payload['error']
-            log.error(f'[fetch] Apps Script returned error: {err}')
-            if err == 'Unauthorized':
-                log.error(f'[fetch] ❌ KEY ไม่ตรง — ตรวจสอบ APPS_SCRIPT_KEY และ SECRET_KEY ใน Code.gs')
-            return _cache_data
+            log.error(f'[fetch] Apps Script returned error: {payload["error"]}')
+            return list(_cache_data), list(_staff_data)
 
-        raw_records: list = payload.get('records', [])
-        records = [_normalise(r) for r in raw_records]
-        log.info(f'[fetch] ✅ loaded {len(records)} records '
-                 f'(sheets={payload.get("sheetsProcessed","?")})')
-        return records
+        records = [_normalise(r) for r in payload.get('records', [])]
+        staff = [_normalise_staff(r) for r in payload.get('staff', [])]
+
+        log.info(
+            f'[fetch] ✅ loaded arrests={len(records)} staff={len(staff)} '
+            f'(sheets={payload.get("sheetsProcessed","?")})'
+        )
+        return records, staff
 
     except requests.exceptions.Timeout:
-        log.error(f'[fetch] ⏱ timeout after {FETCH_TIMEOUT}s — Apps Script ใช้เวลานานเกินไป')
-        return _cache_data
+        log.error(f'[fetch] ⏱ timeout after {FETCH_TIMEOUT}s')
+        return list(_cache_data), list(_staff_data)
     except Exception as e:
         log.error(f'[fetch] {e}', exc_info=True)
-        return _cache_data
+        return list(_cache_data), list(_staff_data)
 
 
 def _normalise(r: dict) -> dict:
-    """แปลง record จาก Apps Script (camelCase) → dict ที่ใช้ในบอท (snake_case)"""
+    """แปลงข้อมูลจับกุมจาก Apps Script"""
     return {
         'sheet':      r.get('sheet', ''),
-        'year_be':    int(r.get('yearBe',   0) or 0),
+        'year_be':    int(r.get('yearBe', 0) or 0),
         'month_num':  int(r.get('monthNum', 0) or 0),
         'month_abbr': r.get('monthAbbr', ''),
         'seq':        r.get('seq', ''),
@@ -121,8 +123,26 @@ def _normalise(r: dict) -> dict:
     }
 
 
+def _normalise_staff(r: dict) -> dict:
+    """แปลงข้อมูลบุคลากรจาก Apps Script"""
+    try:
+        team = int(r.get('team', 0) or 0)
+    except (TypeError, ValueError):
+        team = 0
+
+    return {
+        'name':       str(r.get('name', '') or '').strip(),
+        'position':   str(r.get('position', '') or '').strip(),
+        'phone':      str(r.get('phone', '') or '').strip(),
+        'nickname':   str(r.get('nickname', '') or '').strip(),
+        'image_url':  r.get('imageUrl'),
+        'note':       str(r.get('note', '') or '').strip(),
+        'team':       team,
+    }
+
+
 def _do_fetch():
-    """โหลดข้อมูลและอัปเดต cache ภายใน worker process ที่รับ request จริง"""
+    """โหลดข้อมูลทั้งหมดและอัปเดต cache ใน worker process"""
     global _cache_ts, _fetching
 
     with _fetch_state_lock:
@@ -132,25 +152,29 @@ def _do_fetch():
         _fetching = True
 
     try:
-        fresh = fetch_all()
-        if fresh:
+        fresh_records, fresh_staff = fetch_all()
+        if fresh_records or fresh_staff:
             with _cache_lock:
-                _cache_data.clear()
-                _cache_data.extend(fresh)
+                if fresh_records:
+                    _cache_data.clear()
+                    _cache_data.extend(fresh_records)
+                if fresh_staff:
+                    _staff_data.clear()
+                    _staff_data.extend(fresh_staff)
                 _cache_ts = time.time()
-                count = len(_cache_data)
-            log.info(f'[cache] updated records={count}')
+                arrest_count = len(_cache_data)
+                staff_count = len(_staff_data)
+            log.info(
+                f'[cache] updated arrests={arrest_count} staff={staff_count}'
+            )
         else:
-            with _cache_lock:
-                count = len(_cache_data)
-            log.warning(f'[cache] fetch returned no data; keeping records={count}')
+            log.warning('[cache] fetch returned no data; keeping old cache')
     finally:
         with _fetch_state_lock:
             _fetching = False
 
 
 def _start_fetch_background() -> bool:
-    """เริ่ม fetch ใน background หากยังไม่มีงาน fetch อยู่"""
     with _fetch_state_lock:
         if _fetching:
             return False
@@ -163,40 +187,39 @@ def _start_fetch_background() -> bool:
     return True
 
 
-def get_data(force: bool = False) -> list:
-    """
-    คืน cache แบบ stale-while-revalidate:
-    - มี cache แม้หมดอายุ: ใช้ตอบทันที แล้ว refresh เบื้องหลัง
-    - cache ว่าง: เริ่มโหลดเบื้องหลังและคืน []
-    """
+def get_data(force: bool = False) -> tuple[list, list]:
+    """คืน (ข้อมูลจับกุม, บุคลากร) แบบ stale-while-revalidate"""
     with _cache_lock:
-        snapshot = list(_cache_data)
+        records_snapshot = list(_cache_data)
+        staff_snapshot = list(_staff_data)
         ts = _cache_ts
 
+    has_cache = bool(records_snapshot or staff_snapshot)
     age = (time.time() - ts) if ts else None
-    cache_expired = bool(snapshot) and age is not None and age >= CACHE_TTL
+    cache_expired = has_cache and age is not None and age >= CACHE_TTL
 
     if force:
         _do_fetch()
         with _cache_lock:
-            result = list(_cache_data)
-        log.info(f'[cache] force result={len(result)}')
+            result = (list(_cache_data), list(_staff_data))
+        log.info(
+            f'[cache] force arrests={len(result[0])} staff={len(result[1])}'
+        )
         return result
 
-    if snapshot:
+    if has_cache:
         if cache_expired:
             started = _start_fetch_background()
             log.info(
-                f'[cache] stale records={len(snapshot)} age={int(age)}s '
+                f'[cache] stale arrests={len(records_snapshot)} '
+                f'staff={len(staff_snapshot)} age={int(age)}s '
                 f'refresh_started={started}'
             )
-        else:
-            log.info(f'[cache] hit records={len(snapshot)} age={int(age or 0)}s')
-        return snapshot
+        return records_snapshot, staff_snapshot
 
     started = _start_fetch_background()
     log.info(f'[cache] empty - background_started={started}')
-    return []
+    return [], []
 
 
 # ─── Thai month helpers ───────────────────────────────────────────────────────
@@ -475,6 +498,148 @@ def build_summary_flex(title: str, total: int, cat: dict, records: list) -> Flex
 
 
 
+# ─── Staff / operation team helpers ───────────────────────────────────────────
+BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
+
+
+def _search_key(value: str) -> str:
+    """ทำข้อความให้เหมาะกับการค้นหา: ตัดช่องว่าง จุด และขีด"""
+    return re.sub(r'[\\s.()\\-_/]+', '', str(value or '')).lower()
+
+
+def search_staff(keyword: str, staff: list) -> list:
+    """ค้นหาจากชื่อ ตำแหน่ง หรือชื่อเล่น"""
+    key = _search_key(keyword)
+    if not key:
+        return []
+
+    results = []
+    for person in staff:
+        haystacks = (
+            person.get('name', ''),
+            person.get('position', ''),
+            person.get('nickname', ''),
+        )
+        if any(key in _search_key(value) for value in haystacks):
+            results.append(person)
+    return results
+
+
+def staff_by_team(team: int, staff: list) -> list:
+    return [p for p in staff if p.get('team') == team]
+
+
+def parse_team_command(text: str) -> Optional[int]:
+    """รองรับ ชุดปฏิบัติการ1 / ชป.ที่1 / ชป.1 / ชุด1"""
+    compact = re.sub(r'\\s+', '', text)
+    m = re.fullmatch(
+        r'(?:ชุดปฏิบัติการ(?:ที่)?|ชป\\.(?:ที่)?|ชป(?:ที่)?|ชุด(?:ที่)?)[.]?([12])',
+        compact,
+        re.IGNORECASE
+    )
+    return int(m.group(1)) if m else None
+
+
+def parse_duty_day(text: str) -> Optional[int]:
+    """
+    รองรับ:
+    - วันที่ 18
+    - เวรวันที่ 18
+    - ใครเข้าเวรวันที่ 18
+    - เวรวันนี้ / ใครเข้าเวรวันนี้
+    - วันที่ 18/7/69 หรือ 18 ก.ค. 69 (ใช้เลขวันเท่านั้น)
+    """
+    compact = text.strip()
+
+    if re.search(r'(?:เวรวันนี้|เข้าเวรวันนี้)', compact):
+        return datetime.now(BANGKOK_TZ).day
+
+    if not re.search(r'(?:วันที่|เวร|เข้าเวร)', compact):
+        return None
+
+    m = re.search(r'(?:วันที่\\s*)?(\\d{1,2})(?=\\D|$)', compact)
+    if not m:
+        return None
+
+    day = int(m.group(1))
+    return day if 1 <= day <= 31 else None
+
+
+def build_staff_bubble(person: dict) -> dict:
+    team = person.get('team', 0)
+    team_text = f'ชุดปฏิบัติการที่ {team}' if team in (1, 2) else 'ฝ่ายสืบสวน'
+    color = '#1565C0' if team == 1 else '#7B1FA2' if team == 2 else '#37474F'
+
+    name = person.get('name', '-') or '-'
+    position = person.get('position', '-') or '-'
+    nickname = person.get('nickname', '-') or '-'
+    phone = person.get('phone', '-') or '-'
+    image_url = person.get('image_url')
+
+    bubble = {
+        'type': 'bubble',
+        'size': 'kilo',
+        'header': {
+            'type': 'box',
+            'layout': 'vertical',
+            'backgroundColor': color,
+            'paddingAll': '13px',
+            'contents': [
+                _t(name, weight='bold', size='md', color='#FFFFFF', wrap=True),
+                _t(team_text, size='xs', color='#FFFFFFcc', margin='xs'),
+            ],
+        },
+        'body': {
+            'type': 'box',
+            'layout': 'vertical',
+            'paddingAll': '12px',
+            'spacing': 'sm',
+            'contents': [
+                _row('👮 ตำแหน่ง', position),
+                _row('😊 ชื่อเล่น', nickname),
+                _row('📞 เบอร์โทร', phone),
+            ],
+        },
+    }
+
+    if image_url:
+        bubble['hero'] = {
+            'type': 'image',
+            'url': image_url,
+            'size': 'full',
+            'aspectRatio': '3:4',
+            'aspectMode': 'cover',
+        }
+
+    return bubble
+
+
+def build_staff_carousels(people: list, title: str) -> list:
+    """แสดงบุคลากรทั้งหมด เป็น carousel ละไม่เกิน 10 คน"""
+    if not people:
+        return [TextMessage(text=f"❌ ไม่พบข้อมูล {title}")]
+
+    messages = [
+        TextMessage(text=f"👮 {title}\\nพบทั้งหมด {len(people)} นาย")
+    ]
+
+    # LINE carousel จำกัด 10 bubbles; LINE reply จำกัด 5 messages
+    for start in range(0, min(len(people), 40), 10):
+        chunk = people[start:start + 10]
+        container = {
+            'type': 'carousel',
+            'contents': [build_staff_bubble(p) for p in chunk]
+        }
+        messages.append(
+            FlexMessage(
+                alt_text=f'{title} ({start + 1}-{start + len(chunk)})',
+                contents=FlexContainer.from_dict(container)
+            )
+        )
+
+    return messages[:5]
+
+
 # ─── Continuation text helpers ────────────────────────────────────────────────
 LINE_TEXT_LIMIT = 4800  # เผื่อจากขีดจำกัดข้อความ LINE 5,000 ตัวอักษร
 
@@ -585,6 +750,12 @@ HELP_TEXT = (
     "━━━━━━━━━━━━━━━━━━\n"
     "🔍 bot ค้นหา <ชื่อ>\n"
     "   ค้นหาผู้ต้องหาตามชื่อ\n\n"
+    "👮 bot บุคลากร <ชื่อ/ตำแหน่ง/ชื่อเล่น>\n"
+    "   ค้นหาบุคลากรฝ่ายสืบสวน\n\n"
+    "👥 bot ชป.1 หรือ bot ชุด2\n"
+    "   แสดงสมาชิกชุดปฏิบัติการ\n\n"
+    "🗓️ bot ใครเข้าเวรวันที่ 18\n"
+    "   วันคู่ = ชุด 1, วันคี่ = ชุด 2\n\n"
     "📍 bot สถานที่ <สถานที่>\n"
     "   ค้นหาตามสถานที่จับกุม\n\n"
     "📅 bot เดือน ก.ค. 69\n"
@@ -624,11 +795,13 @@ def _cat_count(rows: list) -> dict:
 def handle_message(text: str) -> list:
     t = text.strip()
     log.info(f'[message] text={t!r}')
-    data = get_data()
-    log.info(f'[message] cache_records={len(data)}')
+    data, staff = get_data()
+    log.info(
+        f'[message] cache_records={len(data)} staff_records={len(staff)}'
+    )
 
     # ── ยังโหลดไม่เสร็จ ──
-    if not data:
+    if not data and not staff:
         return [TextMessage(text=(
             "⏳ ระบบกำลังโหลดข้อมูลจาก Google Sheets\n"
             "กรุณาลองใหม่อีกครั้งใน 1-2 นาที"
@@ -657,6 +830,36 @@ def handle_message(text: str) -> list:
     if re.match(r'^(รีเฟรช|refresh|โหลดใหม่)$', t, re.IGNORECASE):
         threading.Thread(target=lambda: get_data(force=True), daemon=True).start()
         return [TextMessage(text="🔄 กำลังโหลดข้อมูลใหม่จาก Apps Script...")]
+
+    # ── ชุดปฏิบัติการ ──
+    team = parse_team_command(t)
+    if team:
+        people = staff_by_team(team, staff)
+        return build_staff_carousels(
+            people, f"ชุดปฏิบัติการที่ {team}"
+        )
+
+    # ── เวรวันคู่/วันคี่ ──
+    duty_day = parse_duty_day(t)
+    if duty_day:
+        team = 1 if duty_day % 2 == 0 else 2
+        people = staff_by_team(team, staff)
+        parity = "วันคู่" if team == 1 else "วันคี่"
+        return build_staff_carousels(
+            people,
+            f"เวรวันที่ {duty_day} ({parity}) — ชุดปฏิบัติการที่ {team}"
+        )
+
+    # ── ค้นหาบุคลากรแบบระบุคำสั่ง ──
+    m = re.match(r'^(?:บุคลากร|เจ้าหน้าที่|ตำรวจ)\s+(.+)$', t)
+    if m:
+        keyword = m.group(1).strip()
+        people = search_staff(keyword, staff)
+        if not people:
+            return [TextMessage(text=f"❌ ไม่พบบุคลากร '{keyword}'")]
+        return build_staff_carousels(
+            people, f"ผลค้นหาบุคลากร: {keyword}"
+        )
 
     # ── ค้นหาชื่อ ──
     m = re.match(r'^ค้นหา\s+(.+)$', t)
@@ -735,6 +938,14 @@ def handle_message(text: str) -> list:
         if not rows:
             return [TextMessage(text=f"❌ ไม่พบข้อหา '{kw}'")]
         return build_summary_messages(f"⚖️ {kw}", rows)
+
+    # ── ค้นหาบุคลากรอัตโนมัติจากชื่อ/ตำแหน่ง/ชื่อเล่น ──
+    if len(t) >= 2:
+        people = search_staff(t, staff)
+        if people:
+            return build_staff_carousels(
+                people, f"ผลค้นหาบุคลากร: {t}"
+            )
 
     # ── fallback: ลองค้นหาชื่อ (รองรับพิมพ์ชื่อตรงๆ ไม่ต้องมีคำนำหน้า) ──
     if len(t) >= 2:
@@ -866,9 +1077,13 @@ def index():
 
     with _cache_lock:
         n = len(_cache_data)
+        staff_n = len(_staff_data)
         ts = _cache_ts
     age = int(time.time() - ts) if ts else -1
-    return f'LINE Bot สน.บางชัน v4.3 | {n} records | cache age {age}s', 200
+    return (
+        f'LINE Bot สน.บางชัน v5.0 | arrests {n} | '
+        f'staff {staff_n} | cache age {age}s'
+    ), 200
 
 
 @app.route('/debug')
@@ -886,9 +1101,12 @@ def debug():
         try:
             payload  = resp.json()
             n_rec    = len(payload.get('records', []))
+            n_staff  = len(payload.get('staff', []))
             sheets   = payload.get('sheetsProcessed', '?')
             err_msg  = payload.get('error', None)
-            status   = f'OK — {n_rec} records, {sheets} sheets'
+            status   = (
+                f'OK — arrests {n_rec}, staff {n_staff}, {sheets} sheets'
+            )
             if err_msg:
                 status = f'ERROR: {err_msg}'
         except Exception:
@@ -901,7 +1119,8 @@ def debug():
             f'HTTP: {resp.status_code}',
             f'Content-Type: {ct}',
             f'Apps Script status: {status}',
-            f'Cache: {len(_cache_data)} records, age {int(time.time()-_cache_ts) if _cache_ts else -1}s',
+            f'Cache: arrests {len(_cache_data)}, staff {len(_staff_data)}, '
+            f'age {int(time.time()-_cache_ts) if _cache_ts else -1}s',
             f'',
             f'--- Response preview (first 500 chars) ---',
             preview,
