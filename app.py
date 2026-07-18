@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 LINE Bot — ระบบสืบค้นผลการจับกุม สน.บางชัน
-v6.0 — แยกโหลดข้อมูลคดีและบุคลากร ลดปัญหา Apps Script timeout
+v6.1 — ปรับคำสั่งเวร ค้นหาบุคลากร เมนู และการ์ดโทรออก
 ดึงข้อมูลจาก Google Apps Script Web App → cache ใน RAM → ตอบ Flex Message
 """
 
@@ -10,7 +10,7 @@ import re
 import time
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from typing import Optional
 
@@ -519,8 +519,9 @@ def _search_key(value: str) -> str:
 
 
 def search_staff(keyword: str, staff: list) -> list:
-    """ค้นหาจากชื่อ ตำแหน่ง หรือชื่อเล่น"""
+    """ค้นหาบุคลากรจากชื่อ ตำแหน่ง ชื่อเล่น หรือเบอร์โทร"""
     key = _search_key(keyword)
+    phone_key = re.sub(r'\D', '', str(keyword or ''))
     if not key:
         return []
 
@@ -530,55 +531,188 @@ def search_staff(keyword: str, staff: list) -> list:
             person.get('name', ''),
             person.get('position', ''),
             person.get('nickname', ''),
+            person.get('phone', ''),
         )
-        if any(key in _search_key(value) for value in haystacks):
+        text_match = any(key in _search_key(value) for value in haystacks)
+        person_phone = re.sub(r'\D', '', person.get('phone', ''))
+        phone_match = bool(phone_key and len(phone_key) >= 4 and phone_key in person_phone)
+        if text_match or phone_match:
             results.append(person)
-    return results
+
+    return sort_staff(results)
+
+
+def _rank_weight(name: str, position: str) -> int:
+    """เรียงยศ/ตำแหน่งผู้บังคับบัญชาก่อน"""
+    text = f"{name} {position}".replace(" ", "")
+    rules = [
+        ("ผกก.", 10),
+        ("รองผกก.", 20),
+        ("สว.", 30),
+        ("รองสว.", 40),
+        ("ร.ต.อ.", 50),
+        ("ร.ต.ท.", 60),
+        ("ร.ต.ต.", 70),
+        ("ด.ต.", 80),
+        ("จ.ส.ต.", 90),
+        ("ส.ต.อ.", 100),
+        ("ส.ต.ท.", 110),
+        ("ส.ต.ต.", 120),
+    ]
+    for token, weight in rules:
+        if token.replace(" ", "") in text:
+            return weight
+    return 999
+
+
+def sort_staff(people: list) -> list:
+    return sorted(
+        people,
+        key=lambda p: (
+            _rank_weight(p.get('name', ''), p.get('position', '')),
+            _search_key(p.get('name', '')),
+        )
+    )
 
 
 def staff_by_team(team: int, staff: list) -> list:
-    return [p for p in staff if p.get('team') == team]
+    return sort_staff([p for p in staff if p.get('team') == team])
 
 
 def parse_team_command(text: str) -> Optional[int]:
     """รองรับ ชุดปฏิบัติการ1 / ชป.ที่1 / ชป.1 / ชุด1"""
-    compact = re.sub(r'\\s+', '', text)
+    compact = re.sub(r'\s+', '', text.strip())
     m = re.fullmatch(
-        r'(?:ชุดปฏิบัติการ(?:ที่)?|ชป\\.(?:ที่)?|ชป(?:ที่)?|ชุด(?:ที่)?)[.]?([12])',
+        r'(?:ชุดปฏิบัติการ(?:ที่)?|ชป\.?(?:ที่)?|ชุด(?:ที่)?)[.]?([12])',
         compact,
         re.IGNORECASE
     )
     return int(m.group(1)) if m else None
 
 
-def parse_duty_day(text: str) -> Optional[int]:
-    """
-    รองรับ:
-    - วันที่ 18
-    - เวรวันที่ 18
-    - ใครเข้าเวรวันที่ 18
-    - เวรวันนี้ / ใครเข้าเวรวันนี้
-    - วันที่ 18/7/69 หรือ 18 ก.ค. 69 (ใช้เลขวันเท่านั้น)
-    """
-    compact = text.strip()
+THAI_MONTH_LOOKUP = {
+    'ม.ค.': 1, 'มค': 1, 'มกราคม': 1,
+    'ก.พ.': 2, 'กพ': 2, 'กุมภาพันธ์': 2,
+    'มี.ค.': 3, 'มีค': 3, 'มีนาคม': 3,
+    'เม.ย.': 4, 'เมย': 4, 'เมษายน': 4,
+    'พ.ค.': 5, 'พค': 5, 'พฤษภาคม': 5,
+    'มิ.ย.': 6, 'มิย': 6, 'มิถุนายน': 6,
+    'ก.ค.': 7, 'กค': 7, 'กรกฎาคม': 7,
+    'ส.ค.': 8, 'สค': 8, 'สิงหาคม': 8,
+    'ก.ย.': 9, 'กย': 9, 'กันยายน': 9,
+    'ต.ค.': 10, 'ตค': 10, 'ตุลาคม': 10,
+    'พ.ย.': 11, 'พย': 11, 'พฤศจิกายน': 11,
+    'ธ.ค.': 12, 'ธค': 12, 'ธันวาคม': 12,
+}
+THAI_MONTH_FULL = {
+    1: 'มกราคม', 2: 'กุมภาพันธ์', 3: 'มีนาคม', 4: 'เมษายน',
+    5: 'พฤษภาคม', 6: 'มิถุนายน', 7: 'กรกฎาคม', 8: 'สิงหาคม',
+    9: 'กันยายน', 10: 'ตุลาคม', 11: 'พฤศจิกายน', 12: 'ธันวาคม',
+}
+THAI_WEEKDAY = {
+    0: 'วันจันทร์', 1: 'วันอังคาร', 2: 'วันพุธ', 3: 'วันพฤหัสบดี',
+    4: 'วันศุกร์', 5: 'วันเสาร์', 6: 'วันอาทิตย์',
+}
 
-    if re.search(r'(?:เวรวันนี้|เข้าเวรวันนี้)', compact):
-        return datetime.now(BANGKOK_TZ).day
 
-    if not re.search(r'(?:วันที่|เวร|เข้าเวร)', compact):
+def _normalise_be_year(year: Optional[int], fallback_ad: int) -> int:
+    if year is None:
+        return fallback_ad
+    if year < 100:
+        year += 2500
+    if year >= 2400:
+        year -= 543
+    return year
+
+
+def parse_duty_date(text: str) -> Optional[date]:
+    """
+    ตรวจจับคำถามเกี่ยวกับเวรและวัน เช่น:
+    เวร 20 ก.ค.69 / เวรวันที่ 20 / ใครเข้าเวร 20/7/69
+    วันนี้ใครเข้าเวร / เวรพรุ่งนี้ / มะรืนใครอยู่เวร
+    """
+    raw = text.strip()
+    compact = re.sub(r'\s+', '', raw)
+    now = datetime.now(BANGKOK_TZ).date()
+
+    duty_intent = re.search(
+        r'(เวร|เข้าเวร|อยู่เวร|ปฏิบัติหน้าที่|ชุดไหนทำงาน|ใครทำงาน)',
+        raw
+    )
+    if not duty_intent:
         return None
 
-    m = re.search(r'(?:วันที่\\s*)?(\\d{1,2})(?=\\D|$)', compact)
+    if 'มะรืน' in compact:
+        return now + timedelta(days=2)
+    if 'พรุ่งนี้' in compact:
+        return now + timedelta(days=1)
+    if 'วันนี้' in compact:
+        return now
+    if 'เมื่อวาน' in compact:
+        return now - timedelta(days=1)
+
+    # 20/7/69, 20-7-2569, 20.7.69
+    m = re.search(r'(?<!\d)(\d{1,2})\s*[/.-]\s*(\d{1,2})\s*[/.-]\s*(\d{2,4})(?!\d)', raw)
+    if m:
+        day, month, year = map(int, m.groups())
+        year_ad = _normalise_be_year(year, now.year)
+        try:
+            return date(year_ad, month, day)
+        except ValueError:
+            return None
+
+    # 20 ก.ค. 69 / วันที่ 20 กรกฎาคม 2569
+    month_tokens = sorted(THAI_MONTH_LOOKUP, key=len, reverse=True)
+    month_pattern = '|'.join(re.escape(x) for x in month_tokens)
+    m = re.search(
+        rf'(?<!\d)(\d{{1,2}})\s*(?:วันที่)?\s*({month_pattern})\s*\.?\s*(\d{{2,4}})?',
+        raw
+    )
+    if m:
+        day = int(m.group(1))
+        token = m.group(2).rstrip('.')
+        month = THAI_MONTH_LOOKUP.get(m.group(2), THAI_MONTH_LOOKUP.get(token))
+        year = int(m.group(3)) if m.group(3) else None
+        year_ad = _normalise_be_year(year, now.year)
+        try:
+            return date(year_ad, month, day)
+        except (ValueError, TypeError):
+            return None
+
+    # เวรวันที่ 20 / ใครเข้าเวรวัน 20 / เวร 20
+    m = re.search(r'(?:วันที่|วัน|เวร)\s*(\d{1,2})(?!\d)', raw)
     if not m:
-        return None
+        m = re.search(r'เข้าเวร\s*(\d{1,2})(?!\d)', raw)
+    if m:
+        day = int(m.group(1))
+        try:
+            return date(now.year, now.month, day)
+        except ValueError:
+            return None
 
-    day = int(m.group(1))
-    return day if 1 <= day <= 31 else None
+    return None
+
+
+def duty_title(duty_date: date, team: int) -> str:
+    be_year = duty_date.year + 543
+    weekday = THAI_WEEKDAY[duty_date.weekday()]
+    parity = 'วันคู่' if duty_date.day % 2 == 0 else 'วันคี่'
+    return (
+        f"เวร{weekday}ที่ {duty_date.day} "
+        f"{THAI_MONTH_FULL[duty_date.month]} {be_year} "
+        f"({parity}) — ชุดปฏิบัติการที่ {team}"
+    )
+
+
+def _phone_uri(phone: str) -> Optional[str]:
+    digits = re.sub(r'\D', '', phone or '')
+    return f"tel:{digits}" if len(digits) >= 9 else None
 
 
 def build_staff_bubble(person: dict) -> dict:
     team = person.get('team', 0)
     team_text = f'ชุดปฏิบัติการที่ {team}' if team in (1, 2) else 'ฝ่ายสืบสวน'
+    duty_text = 'เข้าเวรวันคู่' if team == 1 else 'เข้าเวรวันคี่' if team == 2 else '-'
     color = '#1565C0' if team == 1 else '#7B1FA2' if team == 2 else '#37474F'
 
     name = person.get('name', '-') or '-'
@@ -586,6 +720,7 @@ def build_staff_bubble(person: dict) -> dict:
     nickname = person.get('nickname', '-') or '-'
     phone = person.get('phone', '-') or '-'
     image_url = person.get('image_url')
+    tel_uri = _phone_uri(phone)
 
     bubble = {
         'type': 'bubble',
@@ -609,6 +744,7 @@ def build_staff_bubble(person: dict) -> dict:
                 _row('👮 ตำแหน่ง', position),
                 _row('😊 ชื่อเล่น', nickname),
                 _row('📞 เบอร์โทร', phone),
+                _row('📅 เวร', duty_text),
             ],
         },
     }
@@ -620,6 +756,28 @@ def build_staff_bubble(person: dict) -> dict:
             'size': 'full',
             'aspectRatio': '3:4',
             'aspectMode': 'cover',
+            'action': {
+                'type': 'uri',
+                'label': 'เปิดรูปภาพ',
+                'uri': image_url,
+            },
+        }
+
+    if tel_uri:
+        bubble['footer'] = {
+            'type': 'box',
+            'layout': 'vertical',
+            'paddingAll': '10px',
+            'contents': [{
+                'type': 'button',
+                'style': 'primary',
+                'height': 'sm',
+                'action': {
+                    'type': 'uri',
+                    'label': f'โทร {phone}',
+                    'uri': tel_uri,
+                },
+            }],
         }
 
     return bubble
@@ -630,8 +788,9 @@ def build_staff_carousels(people: list, title: str) -> list:
     if not people:
         return [TextMessage(text=f"❌ ไม่พบข้อมูล {title}")]
 
+    people = sort_staff(people)
     messages = [
-        TextMessage(text=f"👮 {title}\\nพบทั้งหมด {len(people)} นาย")
+        TextMessage(text=f"👮 {title}\nพบทั้งหมด {len(people)} นาย")
     ]
 
     # LINE carousel จำกัด 10 bubbles; LINE reply จำกัด 5 messages
@@ -649,6 +808,57 @@ def build_staff_carousels(people: list, title: str) -> list:
         )
 
     return messages[:5]
+
+
+def build_main_menu() -> FlexMessage:
+    bubble = {
+        'type': 'bubble',
+        'size': 'mega',
+        'header': {
+            'type': 'box',
+            'layout': 'vertical',
+            'backgroundColor': '#173B57',
+            'paddingAll': '18px',
+            'contents': [
+                _t('🚔 เมนู LINE Bot สน.บางชัน',
+                   color='#FFFFFF', weight='bold', size='lg'),
+                _t('แตะเมนูเพื่อส่งคำสั่ง',
+                   color='#FFFFFFcc', size='sm', margin='sm'),
+            ],
+        },
+        'body': {
+            'type': 'box',
+            'layout': 'vertical',
+            'spacing': 'sm',
+            'paddingAll': '14px',
+            'contents': [
+                {
+                    'type': 'button', 'style': 'primary',
+                    'action': {'type': 'message', 'label': '🚔 เวรวันนี้', 'text': 'เวรวันนี้'}
+                },
+                {
+                    'type': 'button', 'style': 'secondary',
+                    'action': {'type': 'message', 'label': '👥 ชุดปฏิบัติการที่ 1', 'text': 'ชป.1'}
+                },
+                {
+                    'type': 'button', 'style': 'secondary',
+                    'action': {'type': 'message', 'label': '👥 ชุดปฏิบัติการที่ 2', 'text': 'ชป.2'}
+                },
+                {
+                    'type': 'button', 'style': 'secondary',
+                    'action': {'type': 'message', 'label': '📊 สถิติคดี', 'text': 'สถิติ'}
+                },
+                {
+                    'type': 'button',
+                    'action': {'type': 'message', 'label': '❓ วิธีใช้งาน', 'text': 'ช่วยเหลือ'}
+                },
+            ],
+        },
+    }
+    return FlexMessage(
+        alt_text='เมนู LINE Bot สน.บางชัน',
+        contents=FlexContainer.from_dict(bubble)
+    )
 
 
 # ─── Continuation text helpers ────────────────────────────────────────────────
@@ -759,28 +969,24 @@ MONTH_YEAR_DIRECT_RE = re.compile(
 HELP_TEXT = (
     "🚔 คำสั่ง LINE Bot สน.บางชัน\n"
     "━━━━━━━━━━━━━━━━━━\n"
-    "🔍 bot ค้นหา <ชื่อ>\n"
-    "   ค้นหาผู้ต้องหาตามชื่อ\n\n"
-    "👮 bot บุคลากร <ชื่อ/ตำแหน่ง/ชื่อเล่น>\n"
-    "   ค้นหาบุคลากรฝ่ายสืบสวน\n\n"
-    "👥 bot ชป.1 หรือ bot ชุด2\n"
+    "🏠 เมนู\n"
+    "   เปิดเมนูหลักแบบกดเลือกได้\n\n"
+    "👮 <ชื่อ/ตำแหน่ง/ชื่อเล่น/เบอร์โทร>\n"
+    "   เช่น ชนะชัย, รอง ผกก., หนึ่ง, 6780\n\n"
+    "👥 ชป.1 / ชป.ที่2 / ชุด1\n"
     "   แสดงสมาชิกชุดปฏิบัติการ\n\n"
-    "🗓️ bot ใครเข้าเวรวันที่ 18\n"
+    "🗓️ ค้นหาเวรได้หลายรูปแบบ\n"
+    "   เวรวันนี้, ใครเข้าเวรพรุ่งนี้\n"
+    "   เวร 20 ก.ค.69, เข้าเวร 20/7/69\n"
     "   วันคู่ = ชุด 1, วันคี่ = ชุด 2\n\n"
-    "📍 bot สถานที่ <สถานที่>\n"
-    "   ค้นหาตามสถานที่จับกุม\n\n"
-    "📅 bot เดือน ก.ค. 69\n"
-    "   สรุปผลจับกุมรายเดือน\n\n"
-    "📆 bot ปี 2569\n"
-    "   สรุปผลจับกุมรายปี\n\n"
-    "📦 bot ของกลาง <สิ่งของ>\n"
-    "   ค้นหาตามของกลาง\n\n"
-    "⚖️ bot ข้อหา <ข้อหา>\n"
-    "   ค้นหาตามข้อหา\n\n"
-    "📊 bot สถิติ\n"
-    "   ดูสถิติภาพรวม\n\n"
-    "🔄 bot รีเฟรช\n"
-    "   โหลดข้อมูลใหม่จาก Apps Script\n"
+    "🔍 ค้นหา <ชื่อผู้ต้องหา>\n"
+    "📍 สถานที่ <สถานที่จับกุม>\n"
+    "📅 เดือน ก.ค. 69\n"
+    "📆 ปี 2569\n"
+    "📦 ของกลาง <สิ่งของ>\n"
+    "⚖️ ข้อหา <ข้อหา>\n"
+    "📊 สถิติ\n"
+    "🔄 รีเฟรช\n"
     "━━━━━━━━━━━━━━━━━━\n"
     "💡 ใช้ในกลุ่ม: ต้องพิมพ์ bot นำหน้า"
 )
@@ -812,6 +1018,10 @@ def handle_message(text: str) -> list:
     log.info(
         f'[message] arrest_records={len(data)} staff_records={len(staff)}'
     )
+
+    # ── เมนูหลัก ──
+    if re.match(r'^(เมนู|menu|หน้าหลัก|home)$', t, re.IGNORECASE):
+        return [build_main_menu()]
 
     # ── ช่วยเหลือ ──
     if re.match(r'^(ช่วย|help|ช่วยเหลือ|คำสั่ง)$', t, re.IGNORECASE):
@@ -852,15 +1062,14 @@ def handle_message(text: str) -> list:
             people, f"ชุดปฏิบัติการที่ {team}"
         )
 
-    # ── เวรวันคู่/วันคี่ ──
-    duty_day = parse_duty_day(t)
-    if duty_day:
-        team = 1 if duty_day % 2 == 0 else 2
+    # ── เวรวันคู่/วันคี่: ค้นจากฐานบุคลากรก่อนเสมอ ──
+    duty_date = parse_duty_date(t)
+    if duty_date:
+        team = 1 if duty_date.day % 2 == 0 else 2
         people = staff_by_team(team, staff)
-        parity = "วันคู่" if team == 1 else "วันคี่"
         return build_staff_carousels(
             people,
-            f"เวรวันที่ {duty_day} ({parity}) — ชุดปฏิบัติการที่ {team}"
+            duty_title(duty_date, team)
         )
 
     # ── ค้นหาบุคลากรแบบระบุคำสั่ง ──
@@ -873,6 +1082,15 @@ def handle_message(text: str) -> list:
         return build_staff_carousels(
             people, f"ผลค้นหาบุคลากร: {keyword}"
         )
+
+    # ── ค้นหาบุคลากรอัตโนมัติจากชื่อ/ตำแหน่ง/ชื่อเล่น/เบอร์โทร ──
+    # ทำก่อนตรวจฐานคดี เพื่อให้ค้นหาบุคลากรได้ แม้ข้อมูลคดียังโหลดไม่เสร็จ
+    if len(t) >= 2:
+        people = search_staff(t, staff)
+        if people:
+            return build_staff_carousels(
+                people, f"ผลค้นหาบุคลากร: {t}"
+            )
 
     # คำสั่งตั้งแต่ส่วนนี้ต้องใช้ฐานข้อมูลคดี
     if not data:
@@ -958,14 +1176,6 @@ def handle_message(text: str) -> list:
         if not rows:
             return [TextMessage(text=f"❌ ไม่พบข้อหา '{kw}'")]
         return build_summary_messages(f"⚖️ {kw}", rows)
-
-    # ── ค้นหาบุคลากรอัตโนมัติจากชื่อ/ตำแหน่ง/ชื่อเล่น ──
-    if len(t) >= 2:
-        people = search_staff(t, staff)
-        if people:
-            return build_staff_carousels(
-                people, f"ผลค้นหาบุคลากร: {t}"
-            )
 
     # ── fallback: ลองค้นหาชื่อ (รองรับพิมพ์ชื่อตรงๆ ไม่ต้องมีคำนำหน้า) ──
     if len(t) >= 2:
@@ -1105,7 +1315,7 @@ def index():
         staff_n = len(_staff_data)
         staff_age = int(time.time() - _staff_ts) if _staff_ts else -1
     return (
-        f'LINE Bot สน.บางชัน v6.0 | arrests {arrest_n} age {arrest_age}s | '
+        f'LINE Bot สน.บางชัน v6.1 | arrests {arrest_n} age {arrest_age}s | '
         f'staff {staff_n} age {staff_age}s'
     ), 200
 
