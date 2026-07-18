@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 LINE Bot — ระบบสืบค้นผลการจับกุม สน.บางชัน
-v6.2 — แยกผู้ควบคุมชุดออกจากรายชื่อผู้เข้าเวร
+v6.3 — แสดงผู้ควบคุมชุดใน ชป. และไม่รวมในเวร
 ดึงข้อมูลจาก Google Apps Script Web App → cache ใน RAM → ตอบ Flex Message
 """
 
@@ -120,6 +120,8 @@ def _normalise_staff(r: dict) -> dict:
         'image_url': r.get('imageUrl'),
         'note': str(r.get('note', '') or '').strip(),
         'team': team,
+        'controller': bool(r.get('controller', False)),
+        'team_order': int(r.get('teamOrder', 999) or 999),
     }
 
 
@@ -566,9 +568,12 @@ def _rank_weight(name: str, position: str) -> int:
 
 
 def sort_staff(people: list) -> list:
+    """เรียงผู้ควบคุมชุดก่อน แล้วตามลำดับในชีต ชป."""
     return sorted(
         people,
         key=lambda p: (
+            0 if p.get('controller') else 1,
+            int(p.get('team_order', 999) or 999),
             _rank_weight(p.get('name', ''), p.get('position', '')),
             _search_key(p.get('name', '')),
         )
@@ -576,17 +581,15 @@ def sort_staff(people: list) -> list:
 
 
 def staff_by_team(team: int, staff: list) -> list:
+    """สมาชิกทั้งชุด รวมผู้ควบคุมชุด"""
     return sort_staff([p for p in staff if p.get('team') == team])
 
 
 def duty_staff_by_team(team: int, staff: list) -> list:
-    """
-    รายชื่อผู้เข้าเวรของแต่ละชุด
-
-    คนแรกของ ชป.1 และ ชป.2 เป็นสารวัตรผู้ควบคุมชุด
-    จึงไม่รวมอยู่ในรายชื่อผู้เข้าเวร แต่ยังแสดงในคำสั่ง ชป.1/ชป.2 ตามปกติ
-    """
+    """สมาชิกผู้เข้าเวร ไม่รวมผู้ควบคุมชุด"""
     members = staff_by_team(team, staff)
+    if any(p.get('controller') for p in members):
+        return [p for p in members if not p.get('controller')]
     return members[1:] if len(members) > 1 else []
 
 
@@ -722,8 +725,19 @@ def _phone_uri(phone: str) -> Optional[str]:
 
 def build_staff_bubble(person: dict) -> dict:
     team = person.get('team', 0)
-    team_text = f'ชุดปฏิบัติการที่ {team}' if team in (1, 2) else 'ฝ่ายสืบสวน'
-    duty_text = 'เข้าเวรวันคู่' if team == 1 else 'เข้าเวรวันคี่' if team == 2 else '-'
+    is_controller = bool(person.get('controller'))
+    if team in (1, 2):
+        team_text = (
+            f'ผู้ควบคุมชุดปฏิบัติการที่ {team}'
+            if is_controller else f'ชุดปฏิบัติการที่ {team}'
+        )
+    else:
+        team_text = 'ฝ่ายสืบสวน'
+
+    if is_controller:
+        duty_text = 'ผู้ควบคุมชุด — ไม่เข้าเวร'
+    else:
+        duty_text = 'เข้าเวรวันคู่' if team == 1 else 'เข้าเวรวันคี่' if team == 2 else '-'
     color = '#1565C0' if team == 1 else '#7B1FA2' if team == 2 else '#37474F'
 
     name = person.get('name', '-') or '-'
@@ -1327,7 +1341,7 @@ def index():
         staff_n = len(_staff_data)
         staff_age = int(time.time() - _staff_ts) if _staff_ts else -1
     return (
-        f'LINE Bot สน.บางชัน v6.2 | arrests {arrest_n} age {arrest_age}s | '
+        f'LINE Bot สน.บางชัน v6.3 | arrests {arrest_n} age {arrest_age}s | '
         f'staff {staff_n} age {staff_age}s'
     ), 200
 
