@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 LINE Bot — ระบบสืบค้นผลการจับกุม สน.บางชัน
-v6.1 — ปรับคำสั่งเวร ค้นหาบุคลากร เมนู และการ์ดโทรออก
+v6.2 — แยกผู้ควบคุมชุดออกจากรายชื่อผู้เข้าเวร
 ดึงข้อมูลจาก Google Apps Script Web App → cache ใน RAM → ตอบ Flex Message
 """
 
@@ -579,6 +579,17 @@ def staff_by_team(team: int, staff: list) -> list:
     return sort_staff([p for p in staff if p.get('team') == team])
 
 
+def duty_staff_by_team(team: int, staff: list) -> list:
+    """
+    รายชื่อผู้เข้าเวรของแต่ละชุด
+
+    คนแรกของ ชป.1 และ ชป.2 เป็นสารวัตรผู้ควบคุมชุด
+    จึงไม่รวมอยู่ในรายชื่อผู้เข้าเวร แต่ยังแสดงในคำสั่ง ชป.1/ชป.2 ตามปกติ
+    """
+    members = staff_by_team(team, staff)
+    return members[1:] if len(members) > 1 else []
+
+
 def parse_team_command(text: str) -> Optional[int]:
     """รองรับ ชุดปฏิบัติการ1 / ชป.ที่1 / ชป.1 / ชุด1"""
     compact = re.sub(r'\s+', '', text.strip())
@@ -1066,10 +1077,11 @@ def handle_message(text: str) -> list:
     duty_date = parse_duty_date(t)
     if duty_date:
         team = 1 if duty_date.day % 2 == 0 else 2
-        people = staff_by_team(team, staff)
+        people = duty_staff_by_team(team, staff)
+        title = duty_title(duty_date, team) + " (ไม่รวมผู้ควบคุมชุด)"
         return build_staff_carousels(
             people,
-            duty_title(duty_date, team)
+            title
         )
 
     # ── ค้นหาบุคลากรแบบระบุคำสั่ง ──
@@ -1315,7 +1327,7 @@ def index():
         staff_n = len(_staff_data)
         staff_age = int(time.time() - _staff_ts) if _staff_ts else -1
     return (
-        f'LINE Bot สน.บางชัน v6.1 | arrests {arrest_n} age {arrest_age}s | '
+        f'LINE Bot สน.บางชัน v6.2 | arrests {arrest_n} age {arrest_age}s | '
         f'staff {staff_n} age {staff_age}s'
     ), 200
 
