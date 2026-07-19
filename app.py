@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 LINE Bot — ระบบสืบค้นผลการจับกุม สน.บางชัน
-v6.5 — เพิ่มสถานะฐานข้อมูลและค้นหาผู้ต้องหาอัตโนมัติหลังโหลดเสร็จ
+v6.5 — เพิ่มค้นหาคดีแยกตามประเภทข้อหา
 ดึงข้อมูลจาก Google Apps Script Web App → cache ใน RAM → ตอบ Flex Message
 """
 
@@ -63,11 +63,6 @@ _arrest_state_lock = threading.Lock()
 _staff_state_lock = threading.Lock()
 _arrest_fetching = False
 _staff_fetching = False
-
-# คำค้นผู้ต้องหาที่ส่งเข้ามาขณะฐานคดียังโหลดไม่เสร็จ
-_pending_arrest_searches: list[dict] = []
-_pending_lock = threading.RLock()
-MAX_PENDING_SEARCHES = 30
 
 
 def _request_api(mode: str, timeout: int) -> dict:
@@ -157,12 +152,6 @@ def _do_fetch_arrests():
                 _arrest_data.clear()
                 _arrest_data.extend(rows)
                 _arrest_ts = time.time()
-
-            # ตอบคำค้นที่ค้างไว้โดยอัตโนมัติ หลังฐานคดีโหลดเสร็จ
-            try:
-                _process_pending_arrest_searches(rows)
-            except Exception as e:
-                log.error(f'[pending-search] {e}', exc_info=True)
     except requests.exceptions.Timeout:
         log.error(f'[fetch:arrests] timeout after {ARREST_FETCH_TIMEOUT}s')
     except Exception as e:
@@ -244,112 +233,6 @@ def get_staff(force: bool = False, wait_if_empty: bool = False) -> list:
             return list(_staff_data)
     _start_staff_fetch()
     return []
-
-
-def _format_cache_age(ts: float) -> str:
-    if not ts:
-        return "ยังไม่เคยโหลด"
-    age = max(0, int(time.time() - ts))
-    if age < 60:
-        return f"{age} วินาที"
-    return f"{age // 60} นาที {age % 60} วินาที"
-
-
-def database_status_text() -> str:
-    with _arrest_lock:
-        arrest_count = len(_arrest_data)
-        arrest_ts = _arrest_ts
-    with _staff_lock:
-        staff_count = len(_staff_data)
-        staff_ts = _staff_ts
-    with _arrest_state_lock:
-        arrest_loading = _arrest_fetching
-    with _staff_state_lock:
-        staff_loading = _staff_fetching
-    with _pending_lock:
-        pending_count = len(_pending_arrest_searches)
-
-    arrest_state = "กำลังโหลด ⏳" if arrest_loading else (
-        "พร้อม ✅" if arrest_count else "ยังไม่พร้อม ❌"
-    )
-    staff_state = "กำลังโหลด ⏳" if staff_loading else (
-        "พร้อม ✅" if staff_count else "ยังไม่พร้อม ❌"
-    )
-
-    return (
-        "📡 สถานะฐานข้อมูล\n"
-        "━━━━━━━━━━━━━━━━\n"
-        f"👮 บุคลากร: {staff_state}\n"
-        f"   จำนวน {staff_count:,} คน\n"
-        f"   อัปเดตเมื่อ {_format_cache_age(staff_ts)} ที่แล้ว\n\n"
-        f"🔍 ข้อมูลคดี: {arrest_state}\n"
-        f"   จำนวน {arrest_count:,} รายการ\n"
-        f"   อัปเดตเมื่อ {_format_cache_age(arrest_ts)} ที่แล้ว\n\n"
-        f"🕓 คำค้นรอประมวลผล: {pending_count} รายการ"
-    )
-
-
-def _queue_pending_arrest_search(keyword: str, push_to: Optional[str]) -> bool:
-    if not keyword or not push_to:
-        return False
-
-    item = {
-        "keyword": keyword.strip(),
-        "push_to": push_to,
-        "queued_at": time.time(),
-    }
-
-    with _pending_lock:
-        # ไม่เพิ่มคำค้นซ้ำจากปลายทางเดียวกัน
-        for existing in _pending_arrest_searches:
-            if (
-                existing.get("push_to") == push_to
-                and existing.get("keyword") == item["keyword"]
-            ):
-                return True
-
-        if len(_pending_arrest_searches) >= MAX_PENDING_SEARCHES:
-            _pending_arrest_searches.pop(0)
-        _pending_arrest_searches.append(item)
-
-    _start_arrest_fetch()
-    return True
-
-
-def _process_pending_arrest_searches(data: list) -> None:
-    with _pending_lock:
-        pending = list(_pending_arrest_searches)
-        _pending_arrest_searches.clear()
-
-    if not pending:
-        return
-
-    log.info(f'[pending-search] processing {len(pending)} searches')
-
-    for item in pending:
-        keyword = item.get("keyword", "").strip()
-        push_to = item.get("push_to")
-        if not keyword or not push_to:
-            continue
-
-        rows, total = search_name(keyword, data)
-        if rows:
-            messages = build_search_messages(
-                f"🔍 ค้นหา: {keyword}",
-                rows,
-                total,
-                f"ค้นหา: {keyword}",
-            )
-        else:
-            messages = [
-                TextMessage(
-                    text=(
-                        f"❌ โหลดฐานข้อมูลคดีเสร็จแล้ว "
-                        f"แต่ไม่พบ '{keyword}' ในระบบ"
-                    )
-                )
-            ]
-        _push(push_to, messages)
 
 
 # ─── Thai month helpers ───────────────────────────────────────────────────────
@@ -439,6 +322,121 @@ def search_charge(kw: str, data: list):
     kw_l = kw.lower()
     hits  = [r for r in data if kw_l in r.get('charge','').lower()]
     return _sort(hits)[:DETAIL_LIMIT], len(hits)
+
+
+def _case_text(value: str) -> str:
+    """ปรับข้อความสำหรับค้นหาประเภทคดีและรองรับคำพิมพ์ใกล้เคียง"""
+    text = str(value or '').lower()
+    text = re.sub(r'[\s.()\-_/]+', '', text)
+    replacements = {
+        'สเพยาเสพติด': 'เสพยาเสพติด',
+        'เสพยาสเพติด': 'เสพยาเสพติด',
+        'ยาเสพติดให้โทษ': 'ยาเสพติด',
+        'จำหน่ายยา': 'จำหน่ายยาเสพติด',
+        'ขายยาเสพติด': 'จำหน่ายยาเสพติด',
+        'ค้าเสพติด': 'จำหน่ายยาเสพติด',
+        'อาวุธปิน': 'อาวุธปืน',
+        'ปืนเถื่อน': 'อาวุธปืน',
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
+
+CASE_CATEGORY_ALIASES = {
+    'เสพยาเสพติด': (
+        'เสพยาเสพติด', 'เสพยา', 'เสพเมทแอมเฟตามีน',
+        'เสพยาบ้า', 'เสพไอซ์', 'เป็นผู้ขับขี่เสพ',
+    ),
+    'จำหน่ายยาเสพติด': (
+        'จำหน่ายยาเสพติด', 'จำหน่าย', 'มีไว้เพื่อจำหน่าย',
+        'ครอบครองเพื่อจำหน่าย', 'ขายยาเสพติด', 'ค้ายาเสพติด',
+    ),
+    'ครอบครองยาเสพติด': (
+        'ครอบครองยาเสพติด', 'มียาเสพติดไว้ในครอบครอง',
+        'มีไว้ในครอบครอง', 'ครอบครองโดยไม่ได้รับอนุญาต',
+    ),
+    'อาวุธปืน': (
+        'อาวุธปืน', 'มีอาวุธปืน', 'พกพาอาวุธปืน',
+        'เครื่องกระสุนปืน', 'ปืนและเครื่องกระสุน',
+    ),
+    'การพนัน': (
+        'การพนัน', 'ลักลอบเล่นการพนัน', 'ทายผลฟุตบอล',
+        'พนันออนไลน์', 'บาคาร่า', 'สล็อต',
+    ),
+    'หมายจับ': (
+        'หมายจับ', 'จับกุมตามหมายจับ',
+    ),
+}
+
+
+def resolve_case_category(query: str) -> tuple[Optional[str], tuple[str, ...]]:
+    """แปลงคำค้นเป็นหมวดคดีที่ระบบรู้จัก"""
+    key = _case_text(query)
+
+    # ให้หมวดเฉพาะเจาะจงมาก่อนหมวดกว้าง
+    checks = [
+        ('จำหน่ายยาเสพติด', ('จำหน่าย', 'ขายยา', 'ค้ายา', 'เพื่อจำหน่าย')),
+        ('เสพยาเสพติด', ('เสพยา', 'เสพติด', 'ผู้ขับขี่เสพ')),
+        ('ครอบครองยาเสพติด', ('ครอบครองยา', 'มีไว้ในครอบครอง')),
+        ('อาวุธปืน', ('อาวุธปืน', 'ปืน', 'เครื่องกระสุน')),
+        ('การพนัน', ('การพนัน', 'พนัน', 'ทายผล', 'บาคาร่า', 'สล็อต')),
+        ('หมายจับ', ('หมายจับ',)),
+    ]
+
+    for category, tokens in checks:
+        if any(_case_text(token) in key for token in tokens):
+            return category, CASE_CATEGORY_ALIASES[category]
+
+    # ยาเสพติดแบบกว้าง
+    if 'ยาเสพติด' in key or key == 'ยา':
+        return 'ยาเสพติดทั้งหมด', (
+            'ยาเสพติด', 'เมทแอมเฟตามีน', 'ยาบ้า', 'ไอซ์',
+            'เฮโรอีน', 'เคตามีน', 'กัญชา',
+        )
+
+    return None, ()
+
+
+def search_case_category(query: str, data: list):
+    """
+    ค้นหาคดีแยกหมวดจากช่องข้อหา
+    หมวดจำหน่าย/เสพ/ครอบครองจะกันผลลัพธ์ที่ปะปนกันเท่าที่ทำได้
+    """
+    category, aliases = resolve_case_category(query)
+    if not category:
+        return None, [], 0
+
+    hits = []
+    for record in data:
+        charge = _case_text(record.get('charge', ''))
+        matched = any(_case_text(alias) in charge for alias in aliases)
+        if not matched:
+            continue
+
+        if category == 'เสพยาเสพติด':
+            if not ('เสพ' in charge and (
+                'ยาเสพติด' in charge or 'เมทแอมเฟตามีน' in charge
+                or 'ยาบ้า' in charge or 'ไอซ์' in charge
+            )):
+                continue
+
+        elif category == 'จำหน่ายยาเสพติด':
+            if not any(token in charge for token in (
+                'จำหน่าย', 'เพื่อจำหน่าย', 'ขายยาเสพติด', 'ค้ายาเสพติด'
+            )):
+                continue
+
+        elif category == 'ครอบครองยาเสพติด':
+            if 'จำหน่าย' in charge:
+                continue
+            if not ('ครอบครอง' in charge or 'มีไว้ในครอบครอง' in charge):
+                continue
+
+        hits.append(record)
+
+    ordered = _sort(hits)
+    return category, ordered[:DETAIL_LIMIT], len(ordered)
 
 
 def monthly(month_num: int, year_be: int, data: list) -> list:
@@ -1127,9 +1125,11 @@ HELP_TEXT = (
     "📆 ปี 2569\n"
     "📦 ของกลาง <สิ่งของ>\n"
     "⚖️ ข้อหา <ข้อหา>\n"
+    "🚨 คดี <ประเภทคดี>\n"
+    "   เช่น คดีเสพยาเสพติด, คดีจำหน่ายยาเสพติด\n"
+    "   คดีอาวุธปืน หรือพิมพ์ชื่อประเภทตรง ๆ\n"
     "📊 สถิติ\n"
     "🔄 รีเฟรช\n"
-    "📡 สถานะ\n"
     "━━━━━━━━━━━━━━━━━━\n"
     "💡 ใช้ในกลุ่ม: ต้องพิมพ์ bot นำหน้า"
 )
@@ -1152,7 +1152,7 @@ def _cat_count(rows: list) -> dict:
     return c
 
 
-def handle_message(text: str, push_to: Optional[str] = None) -> list:
+def handle_message(text: str) -> list:
     t = text.strip()
     log.info(f'[message] text={t!r}')
     # โหลดบุคลากรก่อน เพราะมีขนาดเล็กและใช้เวลาสั้น
@@ -1169,10 +1169,6 @@ def handle_message(text: str, push_to: Optional[str] = None) -> list:
     # ── ช่วยเหลือ ──
     if re.match(r'^(ช่วย|help|ช่วยเหลือ|คำสั่ง)$', t, re.IGNORECASE):
         return [TextMessage(text=HELP_TEXT)]
-
-    # ── สถานะฐานข้อมูล ──
-    if re.match(r'^(สถานะ|status|เช็กสถานะ|ตรวจสอบสถานะ)$', t, re.IGNORECASE):
-        return [TextMessage(text=database_status_text())]
 
     # ── สถิติ ──
     if re.match(r'^สถิติ$', t):
@@ -1242,27 +1238,9 @@ def handle_message(text: str, push_to: Optional[str] = None) -> list:
 
     # คำสั่งตั้งแต่ส่วนนี้ต้องใช้ฐานข้อมูลคดี
     if not data:
-        # เก็บคำค้นผู้ต้องหาไว้ แล้วตอบอัตโนมัติเมื่อโหลดเสร็จ
-        pending_keyword = t
-        m_pending = re.match(r'^ค้นหา\s+(.+)$', t)
-        if m_pending:
-            pending_keyword = m_pending.group(1).strip()
-
-        queued = False
-        if len(pending_keyword) >= 2:
-            queued = _queue_pending_arrest_search(pending_keyword, push_to)
-
-        if queued:
-            return [TextMessage(text=(
-                "⏳ ข้อมูลคดีกำลังโหลดจาก Google Sheets\n"
-                f"ผมบันทึกคำค้น '{pending_keyword}' ไว้แล้ว\n"
-                "เมื่อโหลดเสร็จ บอทจะส่งผลค้นหาให้อัตโนมัติ"
-            ))]
-
         return [TextMessage(text=(
             "⏳ ข้อมูลคดีกำลังโหลดจาก Google Sheets\n"
-            "ฐานข้อมูลบุคลากรใช้งานได้แล้ว แต่ข้อมูลคดีอาจใช้เวลา 1-2 นาที\n"
-            "พิมพ์ 'สถานะ' เพื่อตรวจสอบ"
+            "ฐานข้อมูลบุคลากรใช้งานได้แล้ว แต่ข้อมูลคดีอาจใช้เวลา 1-2 นาที"
         ))]
 
     # ── ค้นหาชื่อ ──
@@ -1334,6 +1312,38 @@ def handle_message(text: str, push_to: Optional[str] = None) -> list:
             f"📦 ของกลาง: {kw}", rows, total, f"ของกลาง: {kw}"
         )
 
+    # ── ประเภทคดี: เสพยา/จำหน่ายยา/ครอบครองยา/อาวุธปืน ฯลฯ ──
+    m = re.match(
+        r'^(?:ค้นหา\s*)?(?:คดี|ประเภทคดี|คดีประเภท)\s*[:：]?\s*(.+)$',
+        t
+    )
+    category_query = m.group(1).strip() if m else t
+    category, rows, total = search_case_category(category_query, data)
+
+    # คำสั่งมีคำว่า "คดี" หรือเป็นชื่อหมวดตรง ๆ จึงตอบเป็นผลคดี
+    direct_category_words = (
+        'เสพยาเสพติด', 'สเพยาเสพติด', 'จำหน่ายยาเสพติด',
+        'ครอบครองยาเสพติด', 'อาวุธปืน', 'การพนัน',
+        'ยาเสพติด', 'หมายจับ'
+    )
+    is_direct_category = (
+        m is not None
+        or any(_case_text(word) == _case_text(t) for word in direct_category_words)
+    )
+
+    if is_direct_category:
+        if not category:
+            return [TextMessage(text=(
+                f"❓ ยังไม่รู้จักประเภทคดี '{category_query}'\\n"
+                "ตัวอย่าง: คดีเสพยาเสพติด, คดีจำหน่ายยาเสพติด, "
+                "คดีครอบครองยาเสพติด, คดีอาวุธปืน"
+            ))]
+        if not rows:
+            return [TextMessage(text=f"❌ ไม่พบคดีประเภท '{category}'")]
+        return build_summary_messages(
+            f"🚨 คดี{category}", rows
+        )
+
     # ── ข้อหา ──
     m = re.match(r'^ข้อหา\s+(.+)$', t)
     if m:
@@ -1396,7 +1406,7 @@ def on_message(event):
             return
         text = re.sub(r'^bot\s*','', text, flags=re.IGNORECASE).strip()
 
-    msgs = handle_message(text, push_to=push_to)
+    msgs = handle_message(text)
     if not _reply(event.reply_token, msgs) and push_to:
         _push(push_to, msgs)
 
