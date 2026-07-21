@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 LINE Bot — ระบบสืบค้นผลการจับกุม สน.บางชัน
-v6.5 — เพิ่มค้นหาคดีแยกตามประเภทข้อหา
+v6.6 — ค้นหาประเภทคดีและแจ้งเตือนเวรอัตโนมัติ
 ดึงข้อมูลจาก Google Apps Script Web App → cache ใน RAM → ตอบ Flex Message
 """
 
@@ -325,20 +325,19 @@ def search_charge(kw: str, data: list):
 
 
 def _case_text(value: str) -> str:
-    """ปรับข้อความสำหรับค้นหาประเภทคดีและรองรับคำพิมพ์ใกล้เคียง"""
+    """ปรับข้อความสำหรับค้นหาประเภทคดี"""
     text = str(value or '').lower()
     text = re.sub(r'[\s.()\-_/]+', '', text)
-    replacements = {
+
+    corrections = {
         'สเพยาเสพติด': 'เสพยาเสพติด',
         'เสพยาสเพติด': 'เสพยาเสพติด',
-        'ยาเสพติดให้โทษ': 'ยาเสพติด',
-        'จำหน่ายยา': 'จำหน่ายยาเสพติด',
-        'ขายยาเสพติด': 'จำหน่ายยาเสพติด',
-        'ค้าเสพติด': 'จำหน่ายยาเสพติด',
         'อาวุธปิน': 'อาวุธปืน',
         'ปืนเถื่อน': 'อาวุธปืน',
+        'ขายยาเสพติด': 'จำหน่ายยาเสพติด',
+        'ค้ายาเสพติด': 'จำหน่ายยาเสพติด',
     }
-    for old, new in replacements.items():
+    for old, new in corrections.items():
         text = text.replace(old, new)
     return text
 
@@ -346,10 +345,10 @@ def _case_text(value: str) -> str:
 CASE_CATEGORY_ALIASES = {
     'เสพยาเสพติด': (
         'เสพยาเสพติด', 'เสพยา', 'เสพเมทแอมเฟตามีน',
-        'เสพยาบ้า', 'เสพไอซ์', 'เป็นผู้ขับขี่เสพ',
+        'เสพยาบ้า', 'เสพไอซ์', 'ผู้ขับขี่เสพ',
     ),
     'จำหน่ายยาเสพติด': (
-        'จำหน่ายยาเสพติด', 'จำหน่าย', 'มีไว้เพื่อจำหน่าย',
+        'จำหน่ายยาเสพติด', 'มีไว้เพื่อจำหน่าย',
         'ครอบครองเพื่อจำหน่าย', 'ขายยาเสพติด', 'ค้ายาเสพติด',
     ),
     'ครอบครองยาเสพติด': (
@@ -357,7 +356,7 @@ CASE_CATEGORY_ALIASES = {
         'มีไว้ในครอบครอง', 'ครอบครองโดยไม่ได้รับอนุญาต',
     ),
     'อาวุธปืน': (
-        'อาวุธปืน', 'มีอาวุธปืน', 'พกพาอาวุธปืน',
+        'อาวุธปืน', 'พกพาอาวุธปืน',
         'เครื่องกระสุนปืน', 'ปืนและเครื่องกระสุน',
     ),
     'การพนัน': (
@@ -371,13 +370,11 @@ CASE_CATEGORY_ALIASES = {
 
 
 def resolve_case_category(query: str) -> tuple[Optional[str], tuple[str, ...]]:
-    """แปลงคำค้นเป็นหมวดคดีที่ระบบรู้จัก"""
     key = _case_text(query)
 
-    # ให้หมวดเฉพาะเจาะจงมาก่อนหมวดกว้าง
     checks = [
         ('จำหน่ายยาเสพติด', ('จำหน่าย', 'ขายยา', 'ค้ายา', 'เพื่อจำหน่าย')),
-        ('เสพยาเสพติด', ('เสพยา', 'เสพติด', 'ผู้ขับขี่เสพ')),
+        ('เสพยาเสพติด', ('เสพยา', 'ผู้ขับขี่เสพ')),
         ('ครอบครองยาเสพติด', ('ครอบครองยา', 'มีไว้ในครอบครอง')),
         ('อาวุธปืน', ('อาวุธปืน', 'ปืน', 'เครื่องกระสุน')),
         ('การพนัน', ('การพนัน', 'พนัน', 'ทายผล', 'บาคาร่า', 'สล็อต')),
@@ -388,7 +385,6 @@ def resolve_case_category(query: str) -> tuple[Optional[str], tuple[str, ...]]:
         if any(_case_text(token) in key for token in tokens):
             return category, CASE_CATEGORY_ALIASES[category]
 
-    # ยาเสพติดแบบกว้าง
     if 'ยาเสพติด' in key or key == 'ยา':
         return 'ยาเสพติดทั้งหมด', (
             'ยาเสพติด', 'เมทแอมเฟตามีน', 'ยาบ้า', 'ไอซ์',
@@ -399,10 +395,6 @@ def resolve_case_category(query: str) -> tuple[Optional[str], tuple[str, ...]]:
 
 
 def search_case_category(query: str, data: list):
-    """
-    ค้นหาคดีแยกหมวดจากช่องข้อหา
-    หมวดจำหน่าย/เสพ/ครอบครองจะกันผลลัพธ์ที่ปะปนกันเท่าที่ทำได้
-    """
     category, aliases = resolve_case_category(query)
     if not category:
         return None, [], 0
@@ -410,15 +402,11 @@ def search_case_category(query: str, data: list):
     hits = []
     for record in data:
         charge = _case_text(record.get('charge', ''))
-        matched = any(_case_text(alias) in charge for alias in aliases)
-        if not matched:
+        if not any(_case_text(alias) in charge for alias in aliases):
             continue
 
         if category == 'เสพยาเสพติด':
-            if not ('เสพ' in charge and (
-                'ยาเสพติด' in charge or 'เมทแอมเฟตามีน' in charge
-                or 'ยาบ้า' in charge or 'ไอซ์' in charge
-            )):
+            if 'เสพ' not in charge:
                 continue
 
         elif category == 'จำหน่ายยาเสพติด':
@@ -430,7 +418,7 @@ def search_case_category(query: str, data: list):
         elif category == 'ครอบครองยาเสพติด':
             if 'จำหน่าย' in charge:
                 continue
-            if not ('ครอบครอง' in charge or 'มีไว้ในครอบครอง' in charge):
+            if 'ครอบครอง' not in charge and 'มีไว้ในครอบครอง' not in charge:
                 continue
 
         hits.append(record)
@@ -1127,7 +1115,9 @@ HELP_TEXT = (
     "⚖️ ข้อหา <ข้อหา>\n"
     "🚨 คดี <ประเภทคดี>\n"
     "   เช่น คดีเสพยาเสพติด, คดีจำหน่ายยาเสพติด\n"
-    "   คดีอาวุธปืน หรือพิมพ์ชื่อประเภทตรง ๆ\n"
+    "   คดีอาวุธปืน, คดีการพนัน\n"
+    "🆔 รหัสแชต\n"
+    "   ใช้ดูรหัสสำหรับตั้งค่าแจ้งเตือนอัตโนมัติ\n"
     "📊 สถิติ\n"
     "🔄 รีเฟรช\n"
     "━━━━━━━━━━━━━━━━━━\n"
@@ -1312,7 +1302,7 @@ def handle_message(text: str) -> list:
             f"📦 ของกลาง: {kw}", rows, total, f"ของกลาง: {kw}"
         )
 
-    # ── ประเภทคดี: เสพยา/จำหน่ายยา/ครอบครองยา/อาวุธปืน ฯลฯ ──
+    # ── ค้นหาแยกตามประเภทคดี ──
     m = re.match(
         r'^(?:ค้นหา\s*)?(?:คดี|ประเภทคดี|คดีประเภท)\s*[:：]?\s*(.+)$',
         t
@@ -1320,29 +1310,42 @@ def handle_message(text: str) -> list:
     category_query = m.group(1).strip() if m else t
     category, rows, total = search_case_category(category_query, data)
 
-    # คำสั่งมีคำว่า "คดี" หรือเป็นชื่อหมวดตรง ๆ จึงตอบเป็นผลคดี
-    direct_category_words = (
+    direct_categories = (
         'เสพยาเสพติด', 'สเพยาเสพติด', 'จำหน่ายยาเสพติด',
         'ครอบครองยาเสพติด', 'อาวุธปืน', 'การพนัน',
         'ยาเสพติด', 'หมายจับ'
     )
-    is_direct_category = (
+    is_category_command = (
         m is not None
-        or any(_case_text(word) == _case_text(t) for word in direct_category_words)
+        or any(_case_text(word) == _case_text(t) for word in direct_categories)
     )
 
-    if is_direct_category:
+    if is_category_command:
         if not category:
             return [TextMessage(text=(
-                f"❓ ยังไม่รู้จักประเภทคดี '{category_query}'\\n"
+                f"❓ ยังไม่รู้จักประเภทคดี '{category_query}'\n"
                 "ตัวอย่าง: คดีเสพยาเสพติด, คดีจำหน่ายยาเสพติด, "
                 "คดีครอบครองยาเสพติด, คดีอาวุธปืน"
             ))]
         if not rows:
             return [TextMessage(text=f"❌ ไม่พบคดีประเภท '{category}'")]
-        return build_summary_messages(
-            f"🚨 คดี{category}", rows
+
+        messages = [
+            TextMessage(text=(
+                f"🚨 คดี{category}\n"
+                f"พบทั้งหมด {total} ราย "
+                f"(แสดงการ์ด {min(len(rows), 10)} รายแรก)"
+            )),
+            build_carousel(rows[:10], f"คดี{category}"),
+        ]
+        messages.extend(
+            build_remaining_text_messages(
+                rows[10:],
+                start_index=11,
+                title=f"คดี{category} — รายการเพิ่มเติม"
+            )[:3]
         )
+        return messages[:5]
 
     # ── ข้อหา ──
     m = re.match(r'^ข้อหา\s+(.+)$', t)
@@ -1362,6 +1365,41 @@ def handle_message(text: str) -> list:
             )
 
     return [TextMessage(text=f"❓ ไม่พบ '{t}' ในระบบ\nพิมพ์ bot ช่วยเหลือ เพื่อดูคำสั่งทั้งหมด")]
+
+
+# ─── Daily duty notification ─────────────────────────────────────────────────
+def build_daily_duty_messages(target_date: Optional[date] = None) -> list:
+    """สร้างข้อความเวรประจำวันสำหรับ reply หรือ push"""
+    duty_date = target_date or datetime.now(BANGKOK_TZ).date()
+    staff = get_staff(force=True, wait_if_empty=True)
+    team = 1 if duty_date.day % 2 == 0 else 2
+    people = duty_staff_by_team(team, staff)
+
+    title = duty_title(duty_date, team) + " (ไม่รวมผู้ควบคุมชุด)"
+    messages = build_staff_carousels(people, title)
+
+    # เพิ่มข้อความเปิดให้เห็นชัดว่าเป็นการแจ้งเตือนประจำวัน
+    intro = TextMessage(text=(
+        "⏰ แจ้งเตือนเวรประจำวัน เวลา 09.30 น.\n"
+        f"{title}"
+    ))
+    return [intro] + messages[1:]
+
+
+def send_daily_duty_notification(target: str) -> bool:
+    """ส่งเวรวันนี้ไปยัง User ID / Group ID / Room ID"""
+    if not target:
+        log.error('[daily-duty] DUTY_NOTIFY_TARGET is empty')
+        return False
+
+    try:
+        messages = build_daily_duty_messages()
+        _push(target, messages)
+        log.info(f'[daily-duty] sent to {target}')
+        return True
+    except Exception as exc:
+        log.error(f'[daily-duty] failed: {exc}', exc_info=True)
+        return False
 
 
 # ─── LINE reply / push ────────────────────────────────────────────────────────
@@ -1406,9 +1444,31 @@ def on_message(event):
             return
         text = re.sub(r'^bot\s*','', text, flags=re.IGNORECASE).strip()
 
-    msgs = handle_message(text)
+    # ดูรหัสแชตเพื่อใช้ตั้งค่า DUTY_NOTIFY_TARGET
+    if re.match(r'^(รหัสแชต|chat\s*id|group\s*id|ไอดีแชต)$', text, re.IGNORECASE):
+        label = 'Group ID' if source_type == 'group' else (
+            'Room ID' if source_type == 'room' else 'User ID'
+        )
+        msgs = [TextMessage(text=(
+            f"🆔 {label}\n{push_to}\n\n"
+            "นำค่านี้ไปใส่ Environment Variable ชื่อ DUTY_NOTIFY_TARGET"
+        ))]
+    elif re.match(r'^(ทดสอบแจ้งเวร|ทดสอบเวรอัตโนมัติ)$', text):
+        msgs = build_daily_duty_messages()
+    else:
+        msgs = handle_message(text)
+
     if not _reply(event.reply_token, msgs) and push_to:
         _push(push_to, msgs)
+
+
+@handler.add(MessageEvent)
+def on_other_message(event):
+    """รองรับ event ข้อความชนิดอื่นเพื่อไม่ให้เกิด No handler of MessageEvent"""
+    log.info(
+        '[message] unsupported message type=%s',
+        getattr(getattr(event, 'message', None), 'type', 'unknown')
+    )
 
 
 @handler.add(JoinEvent)
@@ -1466,6 +1526,24 @@ def callback():
     return 'OK', 200
 
 
+@app.route('/scheduled-duty', methods=['GET', 'POST'])
+def scheduled_duty():
+    expected = os.environ.get('CRON_SECRET', '')
+    supplied = (
+        request.headers.get('X-Cron-Secret', '')
+        or request.args.get('key', '')
+    )
+    if not expected or supplied != expected:
+        abort(403)
+
+    target = os.environ.get('DUTY_NOTIFY_TARGET', '').strip()
+    if not target:
+        return 'DUTY_NOTIFY_TARGET is not set', 500
+
+    ok = send_daily_duty_notification(target)
+    return ('sent', 200) if ok else ('failed', 500)
+
+
 @app.route('/ping')
 def ping():
     return 'pong', 200
@@ -1491,7 +1569,7 @@ def index():
         staff_n = len(_staff_data)
         staff_age = int(time.time() - _staff_ts) if _staff_ts else -1
     return (
-        f'LINE Bot สน.บางชัน v6.5 | arrests {arrest_n} age {arrest_age}s | '
+        f'LINE Bot สน.บางชัน v6.6 | arrests {arrest_n} age {arrest_age}s | '
         f'staff {staff_n} age {staff_age}s'
     ), 200
 
