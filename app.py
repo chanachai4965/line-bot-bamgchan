@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 LINE Bot — ระบบสืบค้นผลการจับกุม สน.บางชัน
-v6.6 — ค้นหาประเภทคดีและแจ้งเตือนเวรอัตโนมัติ
+v6.7 — แจ้งเตือนเวรล่วงหน้า 09.00 และรายชื่อจริง 09.30
 ดึงข้อมูลจาก Google Apps Script Web App → cache ใน RAM → ตอบ Flex Message
 """
 
@@ -1386,6 +1386,44 @@ def build_daily_duty_messages(target_date: Optional[date] = None) -> list:
     return [intro] + messages[1:]
 
 
+def build_daily_duty_prealert_messages(target_date: Optional[date] = None) -> list:
+    """ข้อความแจ้งเตือนล่วงหน้าเวลา 09.00 น. ยังไม่ส่งรายชื่อทั้งหมด"""
+    duty_date = target_date or datetime.now(BANGKOK_TZ).date()
+    staff = get_staff(force=True, wait_if_empty=True)
+    team = 1 if duty_date.day % 2 == 0 else 2
+    people = duty_staff_by_team(team, staff)
+
+    be_year = duty_date.year + 543
+    weekday = THAI_WEEKDAY[duty_date.weekday()]
+    parity = 'วันคู่' if duty_date.day % 2 == 0 else 'วันคี่'
+
+    text = (
+        "⏰ แจ้งเตือนเวรล่วงหน้า เวลา 09.00 น.\n"
+        f"📅 {weekday}ที่ {duty_date.day} "
+        f"{THAI_MONTH_FULL[duty_date.month]} {be_year}\n"
+        f"🚔 วันนี้เป็น{parity} — ชุดปฏิบัติการที่ {team} เข้าเวร\n"
+        f"👮 ผู้เข้าเวรทั้งหมด {len(people)} นาย\n\n"
+        "ระบบจะแจ้งรายชื่อผู้เข้าเวรจริงอีกครั้ง เวลา 09.30 น."
+    )
+    return [TextMessage(text=text)]
+
+
+def send_daily_duty_prealert(target: str) -> bool:
+    """ส่งแจ้งเตือนล่วงหน้า 09.00 น."""
+    if not target:
+        log.error('[daily-duty-prealert] DUTY_NOTIFY_TARGET is empty')
+        return False
+
+    try:
+        messages = build_daily_duty_prealert_messages()
+        _push(target, messages)
+        log.info(f'[daily-duty-prealert] sent to {target}')
+        return True
+    except Exception as exc:
+        log.error(f'[daily-duty-prealert] failed: {exc}', exc_info=True)
+        return False
+
+
 def send_daily_duty_notification(target: str) -> bool:
     """ส่งเวรวันนี้ไปยัง User ID / Group ID / Room ID"""
     if not target:
@@ -1453,7 +1491,9 @@ def on_message(event):
             f"🆔 {label}\n{push_to}\n\n"
             "นำค่านี้ไปใส่ Environment Variable ชื่อ DUTY_NOTIFY_TARGET"
         ))]
-    elif re.match(r'^(ทดสอบแจ้งเวร|ทดสอบเวรอัตโนมัติ)$', text):
+    elif re.match(r'^(ทดสอบแจ้งล่วงหน้า|ทดสอบเวร0900|ทดสอบเวร 09\.00)$', text):
+        msgs = build_daily_duty_prealert_messages()
+    elif re.match(r'^(ทดสอบแจ้งเวร|ทดสอบเวรอัตโนมัติ|ทดสอบเวร0930|ทดสอบเวร 09\.30)$', text):
         msgs = build_daily_duty_messages()
     else:
         msgs = handle_message(text)
@@ -1526,14 +1566,31 @@ def callback():
     return 'OK', 200
 
 
-@app.route('/scheduled-duty', methods=['GET', 'POST'])
-def scheduled_duty():
+def _cron_authorized() -> bool:
     expected = os.environ.get('CRON_SECRET', '')
     supplied = (
         request.headers.get('X-Cron-Secret', '')
         or request.args.get('key', '')
     )
-    if not expected or supplied != expected:
+    return bool(expected and supplied == expected)
+
+
+@app.route('/scheduled-duty-prealert', methods=['GET', 'POST'])
+def scheduled_duty_prealert():
+    if not _cron_authorized():
+        abort(403)
+
+    target = os.environ.get('DUTY_NOTIFY_TARGET', '').strip()
+    if not target:
+        return 'DUTY_NOTIFY_TARGET is not set', 500
+
+    ok = send_daily_duty_prealert(target)
+    return ('sent', 200) if ok else ('failed', 500)
+
+
+@app.route('/scheduled-duty', methods=['GET', 'POST'])
+def scheduled_duty():
+    if not _cron_authorized():
         abort(403)
 
     target = os.environ.get('DUTY_NOTIFY_TARGET', '').strip()
@@ -1569,7 +1626,7 @@ def index():
         staff_n = len(_staff_data)
         staff_age = int(time.time() - _staff_ts) if _staff_ts else -1
     return (
-        f'LINE Bot สน.บางชัน v6.6 | arrests {arrest_n} age {arrest_age}s | '
+        f'LINE Bot สน.บางชัน v6.7 | arrests {arrest_n} age {arrest_age}s | '
         f'staff {staff_n} age {staff_age}s'
     ), 200
 
