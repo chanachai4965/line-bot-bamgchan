@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 LINE Bot — ระบบสืบค้นผลการจับกุม สน.บางชัน
-v6.7 — แจ้งเตือนเวรล่วงหน้า 09.00 และรายชื่อจริง 09.30
+v6.8 — ตั้งกลุ่มแจ้งเตือนจาก LINE และบันทึกอัตโนมัติ
 ดึงข้อมูลจาก Google Apps Script Web App → cache ใน RAM → ตอบ Flex Message
 """
 
@@ -84,6 +84,50 @@ def _request_api(mode: str, timeout: int) -> dict:
     if payload.get('error'):
         raise RuntimeError(payload['error'])
     return payload
+
+
+
+def notify_config_request(action: str, target: str = '') -> dict:
+    """อ่าน/บันทึกกลุ่มแจ้งเตือนผ่าน Google Apps Script"""
+    payload = {'action': action, 'key': APPS_SCRIPT_KEY}
+    if target:
+        payload['target'] = target
+
+    resp = requests.post(
+        APPS_SCRIPT_URL,
+        json=payload,
+        timeout=APPS_SCRIPT_TIMEOUT,
+        allow_redirects=True,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get('error'):
+        raise RuntimeError(data['error'])
+    return data
+
+
+def save_notify_target(target: str) -> bool:
+    if not target:
+        return False
+    return bool(notify_config_request('set_notify_target', target).get('ok'))
+
+
+def clear_notify_target() -> bool:
+    return bool(notify_config_request('clear_notify_target').get('ok'))
+
+
+def get_saved_notify_target() -> str:
+    try:
+        data = notify_config_request('get_notify_target')
+        return str(data.get('target') or '').strip()
+    except Exception as exc:
+        log.warning(f'[notify-config] read failed: {exc}')
+        return ''
+
+
+def resolve_notify_target() -> str:
+    env_target = os.environ.get('DUTY_NOTIFY_TARGET', '').strip()
+    return env_target or get_saved_notify_target()
 
 
 def _normalise(r: dict) -> dict:
@@ -1408,10 +1452,11 @@ def build_daily_duty_prealert_messages(target_date: Optional[date] = None) -> li
     return [TextMessage(text=text)]
 
 
-def send_daily_duty_prealert(target: str) -> bool:
+def send_daily_duty_prealert(target: str = '') -> bool:
     """ส่งแจ้งเตือนล่วงหน้า 09.00 น."""
+    target = (target or resolve_notify_target()).strip()
     if not target:
-        log.error('[daily-duty-prealert] DUTY_NOTIFY_TARGET is empty')
+        log.error('[daily-duty-prealert] ยังไม่ได้ตั้งกลุ่มแจ้งเตือน')
         return False
 
     try:
@@ -1424,10 +1469,11 @@ def send_daily_duty_prealert(target: str) -> bool:
         return False
 
 
-def send_daily_duty_notification(target: str) -> bool:
+def send_daily_duty_notification(target: str = '') -> bool:
     """ส่งเวรวันนี้ไปยัง User ID / Group ID / Room ID"""
+    target = (target or resolve_notify_target()).strip()
     if not target:
-        log.error('[daily-duty] DUTY_NOTIFY_TARGET is empty')
+        log.error('[daily-duty] ยังไม่ได้ตั้งกลุ่มแจ้งเตือน')
         return False
 
     try:
@@ -1482,8 +1528,53 @@ def on_message(event):
             return
         text = re.sub(r'^bot\s*','', text, flags=re.IGNORECASE).strip()
 
-    # ดูรหัสแชตเพื่อใช้ตั้งค่า DUTY_NOTIFY_TARGET
-    if re.match(r'^(รหัสแชต|chat\s*id|group\s*id|ไอดีแชต)$', text, re.IGNORECASE):
+    if re.match(r'^(ตั้งกลุ่มแจ้งเตือน|ใช้กลุ่มนี้แจ้งเวร|ตั้งค่าแจ้งเวร)$', text):
+        if source_type not in ('group', 'room'):
+            msgs = [TextMessage(text=(
+                "คำสั่งนี้ต้องพิมพ์ในกลุ่ม LINE ที่ต้องการรับแจ้งเตือน\n"
+                "ตัวอย่าง: bot ตั้งกลุ่มแจ้งเตือน"
+            ))]
+        else:
+            try:
+                save_notify_target(push_to)
+                msgs = [TextMessage(text=(
+                    "✅ ตั้งกลุ่มนี้เป็นกลุ่มแจ้งเตือนเวรเรียบร้อยแล้ว\n\n"
+                    "⏰ 09.00 น. แจ้งเตือนล่วงหน้า\n"
+                    "👮 09.30 น. ส่งรายชื่อผู้เข้าเวรจริง\n\n"
+                    "ไม่ต้องใส่ DUTY_NOTIFY_TARGET ใน Render"
+                ))]
+            except Exception as exc:
+                log.error(f'[notify-config] save failed: {exc}', exc_info=True)
+                msgs = [TextMessage(text=(
+                    "❌ บันทึกกลุ่มแจ้งเตือนไม่สำเร็จ\n"
+                    "กรุณาตรวจว่า Code_v6_8.gs ได้ Deploy แล้ว"
+                ))]
+
+    elif re.match(r'^(ตรวจสอบกลุ่มแจ้งเตือน|ดูการแจ้งเตือน|สถานะแจ้งเวร)$', text):
+        saved = get_saved_notify_target()
+        if saved:
+            current = "กลุ่มนี้" if saved == push_to else "กลุ่มอื่น"
+            msgs = [TextMessage(text=(
+                f"✅ ตั้งค่าการแจ้งเตือนไว้แล้ว ({current})\n"
+                "⏰ แจ้งล่วงหน้า 09.00 น.\n"
+                "👮 รายชื่อจริง 09.30 น."
+            ))]
+        else:
+            msgs = [TextMessage(text=(
+                "⚠️ ยังไม่ได้ตั้งกลุ่มแจ้งเตือน\n"
+                "พิมพ์: bot ตั้งกลุ่มแจ้งเตือน"
+            ))]
+
+    elif re.match(r'^(ยกเลิกกลุ่มแจ้งเตือน|ปิดแจ้งเตือนเวร)$', text):
+        try:
+            clear_notify_target()
+            msgs = [TextMessage(text="✅ ยกเลิกกลุ่มแจ้งเตือนเรียบร้อยแล้ว")]
+        except Exception as exc:
+            log.error(f'[notify-config] clear failed: {exc}', exc_info=True)
+            msgs = [TextMessage(text="❌ ยกเลิกการแจ้งเตือนไม่สำเร็จ")]
+
+    # ดูรหัสแชต
+    elif re.match(r'^(รหัสแชต|chat\s*id|group\s*id|ไอดีแชต)$', text, re.IGNORECASE):
         label = 'Group ID' if source_type == 'group' else (
             'Room ID' if source_type == 'room' else 'User ID'
         )
@@ -1580,9 +1671,9 @@ def scheduled_duty_prealert():
     if not _cron_authorized():
         abort(403)
 
-    target = os.environ.get('DUTY_NOTIFY_TARGET', '').strip()
+    target = resolve_notify_target()
     if not target:
-        return 'DUTY_NOTIFY_TARGET is not set', 500
+        return 'notification target is not configured', 500
 
     ok = send_daily_duty_prealert(target)
     return ('sent', 200) if ok else ('failed', 500)
@@ -1593,9 +1684,9 @@ def scheduled_duty():
     if not _cron_authorized():
         abort(403)
 
-    target = os.environ.get('DUTY_NOTIFY_TARGET', '').strip()
+    target = resolve_notify_target()
     if not target:
-        return 'DUTY_NOTIFY_TARGET is not set', 500
+        return 'notification target is not configured', 500
 
     ok = send_daily_duty_notification(target)
     return ('sent', 200) if ok else ('failed', 500)
@@ -1626,7 +1717,7 @@ def index():
         staff_n = len(_staff_data)
         staff_age = int(time.time() - _staff_ts) if _staff_ts else -1
     return (
-        f'LINE Bot สน.บางชัน v6.7 | arrests {arrest_n} age {arrest_age}s | '
+        f'LINE Bot สน.บางชัน v6.8 | arrests {arrest_n} age {arrest_age}s | '
         f'staff {staff_n} age {staff_age}s'
     ), 200
 
