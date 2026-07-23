@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 LINE Bot — ระบบสืบค้นผลการจับกุม สน.บางชัน
-v6.8 — ตั้งกลุ่มแจ้งเตือนจาก LINE และบันทึกอัตโนมัติ
+v6.8.1 — แก้ APPS_SCRIPT_TIMEOUT สำหรับบันทึกกลุ่มแจ้งเตือน
 ดึงข้อมูลจาก Google Apps Script Web App → cache ใน RAM → ตอบ Flex Message
 """
 
@@ -46,6 +46,7 @@ ARREST_CACHE_TTL           = int(os.environ.get('ARREST_CACHE_TTL', '900'))
 STAFF_CACHE_TTL            = int(os.environ.get('STAFF_CACHE_TTL', '300'))
 ARREST_FETCH_TIMEOUT       = int(os.environ.get('ARREST_FETCH_TIMEOUT', '180'))
 STAFF_FETCH_TIMEOUT        = int(os.environ.get('STAFF_FETCH_TIMEOUT', '45'))
+APPS_SCRIPT_TIMEOUT        = int(os.environ.get('APPS_SCRIPT_TIMEOUT', '45'))
 DETAIL_LIMIT               = 30
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
