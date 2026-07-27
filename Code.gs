@@ -1,5 +1,5 @@
 /**
- * LINE Bot สน.บางชัน — Google Apps Script Data API v6.0
+ * LINE Bot สน.บางชัน — Google Apps Script Data API v6.8.3
  * วิธีใช้: Deploy → New Deployment → Web App
  *          Execute as: Me, Who has access: Anyone
  *
@@ -51,7 +51,7 @@ function doGet(e) {
       return json(getArrestRecords());
     }
     if (mode === 'ping') {
-      return json({ ok: true, version: '6.0' });
+      return json({ ok: true, version: '6.8.3' });
     }
     return json({ error: 'Unknown mode', allowed: ['staff', 'arrests', 'ping'] });
   } catch (err) {
@@ -64,6 +64,50 @@ function json(obj) {
     .createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
 }
+
+// ─── Notification target configuration v6.8 ─────────────────────────────────
+function doPost(e) {
+  try {
+    const raw = (e && e.postData && e.postData.contents) || '{}';
+    const body = JSON.parse(raw);
+    const key = String(body.key || '');
+
+    if (key !== SECRET_KEY) {
+      return json({ error: 'Unauthorized' });
+    }
+
+    const action = String(body.action || '').toLowerCase();
+    const props = PropertiesService.getScriptProperties();
+    const propName = 'LINE_DUTY_NOTIFY_TARGET';
+
+    if (action === 'set_notify_target') {
+      const target = String(body.target || '').trim();
+      if (!/^[CUR][A-Za-z0-9_-]{10,}$/.test(target)) {
+        return json({ error: 'Invalid LINE target ID' });
+      }
+      props.setProperty(propName, target);
+      return json({ ok: true, action: action });
+    }
+
+    if (action === 'get_notify_target') {
+      return json({
+        ok: true,
+        action: action,
+        target: props.getProperty(propName) || ''
+      });
+    }
+
+    if (action === 'clear_notify_target') {
+      props.deleteProperty(propName);
+      return json({ ok: true, action: action });
+    }
+
+    return json({ error: 'Unknown action' });
+  } catch (err) {
+    return json({ error: err.message, stack: err.stack });
+  }
+}
+
 
 // ─── Fetch all sheets ─────────────────────────────────────────────────────────
 function getArrestRecords() {
@@ -153,12 +197,12 @@ function parseSheet(ws, sheetName) {
     if (row.every(v => v === null || v === undefined || v === '')) continue;
 
     let imageUrl = null;
+    let recordFileUrl = '';
     if (isNew) {
       const imageIdx = COL.image;
       const fileIdx  = COL.file;
 
       const rawImgValue = imageIdx !== undefined ? row[imageIdx] : null;
-      const rawFileValue= fileIdx  !== undefined ? row[fileIdx]  : null;
 
       const imgVal      = g('image');
       const fileVal     = g('file');
@@ -167,15 +211,17 @@ function parseSheet(ws, sheetName) {
       const imgLink     = imageIdx !== undefined ? richTextLink(richTexts[i][imageIdx]) : '';
       const fileLink    = fileIdx  !== undefined ? richTextLink(richTexts[i][fileIdx])  : '';
 
-      // รองรับภาพที่แทรกอยู่ในเซลล์โดยตรง (Insert image in cell)
+      // คอลัมน์ J = รูปภาพผู้ต้องหาเท่านั้น
       imageUrl = cellImageUrl(rawImgValue)
               || normaliseImageUrl(imgVal)
               || normaliseImageUrl(imgLink)
-              || imageUrlFromFormula(imgFormula)
-              || cellImageUrl(rawFileValue)
-              || normaliseImageUrl(fileVal)
-              || normaliseImageUrl(fileLink)
-              || imageUrlFromFormula(fileFormula);
+              || imageUrlFromFormula(imgFormula);
+
+      // คอลัมน์ M = ไฟล์บันทึกจับกุม
+      recordFileUrl = normaliseFileUrl(fileVal)
+                   || normaliseFileUrl(fileLink)
+                   || fileUrlFromFormula(fileFormula)
+                   || '';
     }
 
     records.push({
@@ -193,8 +239,9 @@ function parseSheet(ws, sheetName) {
       pid:       g('pid'),
       evidence:  g('evidence'),
       location:  g('location'),
-      note:      isNew ? g('note')     : '',
-      imageUrl:  imageUrl
+      note:          isNew ? g('note') : '',
+      imageUrl:      imageUrl,
+      recordFileUrl: recordFileUrl
     });
   }
 
@@ -406,6 +453,20 @@ function imageUrlFromFormula(formula) {
   // รองรับ =IMAGE("url") และ =HYPERLINK("url","ข้อความ")
   const m = formula.match(/=(?:IMAGE|HYPERLINK)\s*\(\s*"([^"]+)"/i);
   return m ? normaliseImageUrl(m[1]) : null;
+}
+
+
+function fileUrlFromFormula(formula) {
+  if (!formula) return '';
+  const m = String(formula).match(/=HYPERLINK\s*\(\s*"([^"]+)"/i);
+  return m ? normaliseFileUrl(m[1]) : '';
+}
+
+function normaliseFileUrl(url) {
+  if (!url) return '';
+  url = String(url).trim();
+  if (!url) return '';
+  return /^https?:\/\//i.test(url) ? url : '';
 }
 
 function normaliseImageUrl(url) {

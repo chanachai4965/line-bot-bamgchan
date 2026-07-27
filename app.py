@@ -108,6 +108,7 @@ def _normalise(r: dict) -> dict:
         'location': r.get('location', ''),
         'note': r.get('note', ''),
         'image_url': r.get('imageUrl'),
+        'record_file_url': str(r.get('recordFileUrl', '') or '').strip(),
     }
 
 
@@ -494,6 +495,7 @@ def build_bubble(rec: dict) -> dict:
     evidence   = rec.get('evidence','') or '-'
     age        = rec.get('age','') or '-'
     image_url  = rec.get('image_url')
+    record_file_url = str(rec.get('record_file_url','') or '').strip()
     month_abbr = rec.get('month_abbr','')
     year_be    = rec.get('year_be','')
     period     = f"{month_abbr} {year_be}".strip() or rec.get('sheet','')
@@ -535,6 +537,24 @@ def build_bubble(rec: dict) -> dict:
         bubble['hero'] = {
             'type':'image','url':image_url,
             'size':'full','aspectRatio':'4:3','aspectMode':'cover',
+        }
+
+    if record_file_url.startswith(('http://', 'https://')):
+        bubble['footer'] = {
+            'type':'box',
+            'layout':'vertical',
+            'paddingAll':'10px',
+            'contents':[{
+                'type':'button',
+                'style':'primary',
+                'height':'sm',
+                'color':color,
+                'action':{
+                    'type':'uri',
+                    'label':'📄 เปิดไฟล์บันทึกจับกุม',
+                    'uri':record_file_url,
+                },
+            }],
         }
     return bubble
 
