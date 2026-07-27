@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
 LINE Bot — ระบบสืบค้นผลการจับกุม สน.บางชัน
-v4.1 — Apps Script Edition
-- Cache: คืน stale data ทันที, ไม่ขึ้น "⏳" ถ้ายังมี cache เก่า
-- Search: token-based matching, normalise whitespace, ค้นจากชื่อเล่นด้วย
-- Cards: 10 รายการแรก → Flex carousel, รายการที่ 11-30 → text list
+v6.6.1 — แก้ webhook ไม่ตอบ: bypass SDK dispatcher + รองรับเวรวันนี้
+ดึงข้อมูลจาก Google Apps Script Web App → cache ใน RAM → ตอบ Flex Message
 """
 
 import os
 import re
 import time
+import json
+import hmac
+import hashlib
+import base64
 import logging
 import threading
+from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 import requests
@@ -42,147 +46,197 @@ LINE_CHANNEL_ACCESS_TOKEN  = os.environ['LINE_CHANNEL_ACCESS_TOKEN']
 APPS_SCRIPT_URL            = os.environ['APPS_SCRIPT_URL']
 # Secret key สำหรับป้องกัน Apps Script ถูกเรียกโดยคนอื่น (ต้องตรงกับ Code.gs)
 APPS_SCRIPT_KEY            = os.environ.get('APPS_SCRIPT_KEY', '')
-CACHE_TTL                  = int(os.environ.get('CACHE_TTL', '300'))    # วินาที
-FETCH_TIMEOUT              = int(os.environ.get('FETCH_TIMEOUT', '90')) # วินาที
+ARREST_CACHE_TTL           = int(os.environ.get('ARREST_CACHE_TTL', '900'))
+STAFF_CACHE_TTL            = int(os.environ.get('STAFF_CACHE_TTL', '300'))
+ARREST_FETCH_TIMEOUT       = int(os.environ.get('ARREST_FETCH_TIMEOUT', '180'))
+STAFF_FETCH_TIMEOUT        = int(os.environ.get('STAFF_FETCH_TIMEOUT', '45'))
 DETAIL_LIMIT               = 30
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler       = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# ─── Data cache ───────────────────────────────────────────────────────────────
-_cache_data: list  = []
-_cache_ts:   float = 0.0
-_cache_lock        = threading.Lock()
-_fetching:   bool  = False   # True = background fetch กำลังทำงานอยู่
+# ─── แยก Cache: ข้อมูลคดี / ข้อมูลบุคลากร ───────────────────────────────────
+_arrest_data: list = []
+_staff_data: list = []
+_arrest_ts: float = 0.0
+_staff_ts: float = 0.0
+
+_arrest_lock = threading.RLock()
+_staff_lock = threading.RLock()
+_arrest_state_lock = threading.Lock()
+_staff_state_lock = threading.Lock()
+_arrest_fetching = False
+_staff_fetching = False
 
 
-def fetch_all() -> list:
-    """เรียก Apps Script Web App → คืน list ของ record dict (snake_case)"""
-    try:
-        params = {'key': APPS_SCRIPT_KEY} if APPS_SCRIPT_KEY else {}
-        log.info(f'[fetch] GET {APPS_SCRIPT_URL} key={bool(APPS_SCRIPT_KEY)}')
-        resp = requests.get(
-            APPS_SCRIPT_URL, params=params,
-            timeout=FETCH_TIMEOUT, allow_redirects=True
-        )
-        log.info(f'[fetch] HTTP {resp.status_code} url={resp.url[:80]}')
-
-        # ตรวจสอบว่า response เป็น JSON จริง ไม่ใช่ HTML error page
-        ct = resp.headers.get('Content-Type', '')
-        if 'html' in ct:
-            log.error('[fetch] got HTML instead of JSON — Apps Script may need authorization')
-            log.error(f'[fetch] first 300 chars: {resp.text[:300]}')
-            return _cache_data
-
-        resp.raise_for_status()
-        payload = resp.json()
-
-        if 'error' in payload:
-            err = payload['error']
-            log.error(f'[fetch] Apps Script returned error: {err}')
-            if err == 'Unauthorized':
-                log.error('[fetch] ❌ KEY ไม่ตรง — ตรวจสอบ APPS_SCRIPT_KEY และ SECRET_KEY ใน Code.gs')
-            return _cache_data
-
-        raw_records: list = payload.get('records', [])
-        records = [_normalise(r) for r in raw_records]
-        log.info(f'[fetch] ✅ loaded {len(records)} records '
-                 f'(sheets={payload.get("sheetsProcessed","?")})')
-        return records
-
-    except requests.exceptions.Timeout:
-        log.error(f'[fetch] ⏱ timeout after {FETCH_TIMEOUT}s — Apps Script ใช้เวลานานเกินไป')
-        return _cache_data
-    except Exception as e:
-        log.error(f'[fetch] {e}', exc_info=True)
-        return _cache_data
+def _request_api(mode: str, timeout: int) -> dict:
+    params = {'mode': mode}
+    if APPS_SCRIPT_KEY:
+        params['key'] = APPS_SCRIPT_KEY
+    log.info(f'[fetch:{mode}] GET Apps Script timeout={timeout}s')
+    resp = requests.get(
+        APPS_SCRIPT_URL,
+        params=params,
+        timeout=timeout,
+        allow_redirects=True,
+    )
+    log.info(f'[fetch:{mode}] HTTP {resp.status_code}')
+    if 'html' in resp.headers.get('Content-Type', '').lower():
+        raise RuntimeError('Apps Script ส่ง HTML กลับมาแทน JSON')
+    resp.raise_for_status()
+    payload = resp.json()
+    if payload.get('error'):
+        raise RuntimeError(payload['error'])
+    return payload
 
 
 def _normalise(r: dict) -> dict:
-    """แปลง record จาก Apps Script (camelCase) → dict ที่ใช้ในบอท (snake_case)"""
     return {
-        'sheet':      r.get('sheet', ''),
-        'year_be':    int(r.get('yearBe',   0) or 0),
-        'month_num':  int(r.get('monthNum', 0) or 0),
+        'sheet': r.get('sheet', ''),
+        'year_be': int(r.get('yearBe', 0) or 0),
+        'month_num': int(r.get('monthNum', 0) or 0),
         'month_abbr': r.get('monthAbbr', ''),
-        'seq':        r.get('seq', ''),
-        'date':       r.get('date', ''),
-        'group':      r.get('group', ''),
-        'charge':     r.get('charge', ''),
-        'name':       r.get('name', ''),
-        'nickname':   r.get('nickname', ''),
-        'age':        r.get('age', ''),
-        'pid':        r.get('pid', ''),
-        'evidence':   r.get('evidence', ''),
-        'location':   r.get('location', ''),
-        'note':            r.get('note', ''),
-        'image_url':       r.get('imageUrl'),
-        'record_file_url': r.get('recordFileUrl'),   # ไฟล์บันทึกจับกุม (ก.ค.69+)
+        'seq': r.get('seq', ''),
+        'date': r.get('date', ''),
+        'group': r.get('group', ''),
+        'charge': r.get('charge', ''),
+        'name': r.get('name', ''),
+        'nickname': r.get('nickname', ''),
+        'age': r.get('age', ''),
+        'pid': r.get('pid', ''),
+        'evidence': r.get('evidence', ''),
+        'location': r.get('location', ''),
+        'note': r.get('note', ''),
+        'image_url': r.get('imageUrl'),
     }
 
 
-def _do_fetch():
-    """Fetch data in background — อัปเดต cache โดยไม่ block webhook handler"""
-    global _cache_data, _cache_ts, _fetching
-    if _fetching:
-        return  # ถ้า fetch อยู่แล้ว ไม่ต้อง fetch ซ้ำ
-    _fetching = True
+def _normalise_staff(r: dict) -> dict:
     try:
-        fresh = fetch_all()
-        with _cache_lock:
-            if fresh:
-                _cache_data = fresh
-                _cache_ts   = time.time()
+        team = int(r.get('team', 0) or 0)
+    except (TypeError, ValueError):
+        team = 0
+    return {
+        'name': str(r.get('name', '') or '').strip(),
+        'position': str(r.get('position', '') or '').strip(),
+        'phone': str(r.get('phone', '') or '').strip(),
+        'nickname': str(r.get('nickname', '') or '').strip(),
+        'image_url': r.get('imageUrl'),
+        'note': str(r.get('note', '') or '').strip(),
+        'team': team,
+        'controller': bool(r.get('controller', False)),
+        'team_order': int(r.get('teamOrder', 999) or 999),
+    }
+
+
+def fetch_arrests() -> list:
+    payload = _request_api('arrests', ARREST_FETCH_TIMEOUT)
+    rows = [_normalise(r) for r in payload.get('records', [])]
+    log.info(f'[fetch:arrests] ✅ {len(rows)} records')
+    return rows
+
+
+def fetch_staff() -> list:
+    payload = _request_api('staff', STAFF_FETCH_TIMEOUT)
+    rows = [_normalise_staff(r) for r in payload.get('staff', [])]
+    log.info(f'[fetch:staff] ✅ {len(rows)} people')
+    return rows
+
+
+def _do_fetch_arrests():
+    global _arrest_ts, _arrest_fetching
+    with _arrest_state_lock:
+        if _arrest_fetching:
+            return
+        _arrest_fetching = True
+    try:
+        rows = fetch_arrests()
+        if rows:
+            with _arrest_lock:
+                _arrest_data.clear()
+                _arrest_data.extend(rows)
+                _arrest_ts = time.time()
+    except requests.exceptions.Timeout:
+        log.error(f'[fetch:arrests] timeout after {ARREST_FETCH_TIMEOUT}s')
+    except Exception as e:
+        log.error(f'[fetch:arrests] {e}', exc_info=True)
     finally:
-        _fetching = False
+        with _arrest_state_lock:
+            _arrest_fetching = False
 
 
-def get_data(force: bool = False) -> list:
-    """คืน cached data ทันที — ไม่ block webhook handler เด็ดขาด
-    - cache ว่างเปล่า (ครั้งแรก): เริ่ม fetch + คืน []
-    - cache มีข้อมูลและยังใหม่: คืนทันที
-    - cache มีข้อมูลแต่หมดอายุ: เริ่ม background refresh + คืน stale data ทันที
-      (ไม่แสดง ⏳ loading message กับผู้ใช้)
-    """
-    global _cache_data, _cache_ts
-    with _cache_lock:
-        snapshot = list(_cache_data)
-        ts       = _cache_ts
+def _do_fetch_staff():
+    global _staff_ts, _staff_fetching
+    with _staff_state_lock:
+        if _staff_fetching:
+            return
+        _staff_fetching = True
+    try:
+        rows = fetch_staff()
+        if rows:
+            with _staff_lock:
+                _staff_data.clear()
+                _staff_data.extend(rows)
+                _staff_ts = time.time()
+    except requests.exceptions.Timeout:
+        log.error(f'[fetch:staff] timeout after {STAFF_FETCH_TIMEOUT}s')
+    except Exception as e:
+        log.error(f'[fetch:staff] {e}', exc_info=True)
+    finally:
+        with _staff_state_lock:
+            _staff_fetching = False
 
-    cache_valid = bool(snapshot) and (time.time() - ts) < CACHE_TTL
 
+def _start_arrest_fetch() -> bool:
+    with _arrest_state_lock:
+        if _arrest_fetching:
+            return False
+    threading.Thread(target=_do_fetch_arrests, daemon=True, name='fetch-arrests').start()
+    return True
+
+
+def _start_staff_fetch() -> bool:
+    with _staff_state_lock:
+        if _staff_fetching:
+            return False
+    threading.Thread(target=_do_fetch_staff, daemon=True, name='fetch-staff').start()
+    return True
+
+
+def get_arrests(force: bool = False) -> list:
+    with _arrest_lock:
+        snapshot = list(_arrest_data)
+        ts = _arrest_ts
     if force:
-        # /refresh endpoint: รอ fetch จริง (ไม่ใช่ webhook path)
-        _do_fetch()
-        with _cache_lock:
-            return list(_cache_data)
-
-    if cache_valid:
+        _do_fetch_arrests()
+        with _arrest_lock:
+            return list(_arrest_data)
+    if snapshot:
+        if ts and time.time() - ts >= ARREST_CACHE_TTL:
+            _start_arrest_fetch()
         return snapshot
-
-    # Cache หมดอายุหรือว่างเปล่า → เริ่ม background fetch แล้วคืนทันที
-    # ถ้ามี stale data → คืน stale data (ผู้ใช้ไม่เห็น loading message)
-    # ถ้าว่างเปล่า → คืน [] (จะขึ้น loading message ครั้งแรกเท่านั้น)
-    if not _fetching:
-        threading.Thread(target=_do_fetch, daemon=True).start()
-    return snapshot
+    _start_arrest_fetch()
+    return []
 
 
-def cache_is_stale() -> bool:
-    """True ถ้า cache มีข้อมูลแต่หมดอายุแล้ว (กำลัง refresh อยู่)"""
-    with _cache_lock:
-        snapshot = list(_cache_data)
-        ts       = _cache_ts
-    return bool(snapshot) and (time.time() - ts) >= CACHE_TTL
-
-
-# ─── Text normalisation ───────────────────────────────────────────────────────
-def normalise_text(s) -> str:
-    """ตัดช่องว่างซ้ำ normalize ข้อความ — รองรับ str/int/float/None"""
-    if s is None:
-        return ''
-    s = str(s).strip()
-    return re.sub(r'\s+', ' ', s)
+def get_staff(force: bool = False, wait_if_empty: bool = False) -> list:
+    with _staff_lock:
+        snapshot = list(_staff_data)
+        ts = _staff_ts
+    if force:
+        _do_fetch_staff()
+        with _staff_lock:
+            return list(_staff_data)
+    if snapshot:
+        if ts and time.time() - ts >= STAFF_CACHE_TTL:
+            _start_staff_fetch()
+        return snapshot
+    if wait_if_empty:
+        _do_fetch_staff()
+        with _staff_lock:
+            return list(_staff_data)
+    _start_staff_fetch()
+    return []
 
 
 # ─── Thai month helpers ───────────────────────────────────────────────────────
@@ -249,21 +303,8 @@ def _sort(records: list) -> list:
 
 
 def search_name(kw: str, data: list):
-    """ค้นหาชื่อแบบ token-based:
-    - 'สร้อย'         → ทุก record ที่มี 'สร้อย' ในชื่อ/ชื่อเล่น
-    - 'สิทธิชัย สร้อย' → ต้องมีทั้ง 'สิทธิชัย' และ 'สร้อย' ในชื่อ/ชื่อเล่น
-    - รองรับช่องว่างซ้ำ เช่น 'สิทธิชัย  สร้อย'
-    """
-    kw_norm = normalise_text(kw).lower()
-    tokens  = kw_norm.split()  # แยกด้วย whitespace
-
-    def matches(r: dict) -> bool:
-        name     = normalise_text(r.get('name', '') or '').lower()
-        nickname = normalise_text(r.get('nickname', '') or '').lower()
-        combined = name + ' ' + nickname
-        return all(tok in combined for tok in tokens)
-
-    hits = [r for r in data if matches(r)]
+    kw_l = kw.lower()
+    hits  = [r for r in data if kw_l in r['name'].lower()]
     return _sort(hits)[:DETAIL_LIMIT], len(hits)
 
 
@@ -285,6 +326,109 @@ def search_charge(kw: str, data: list):
     kw_l = kw.lower()
     hits  = [r for r in data if kw_l in r.get('charge','').lower()]
     return _sort(hits)[:DETAIL_LIMIT], len(hits)
+
+
+def _case_text(value: str) -> str:
+    """ปรับข้อความสำหรับค้นหาประเภทคดี"""
+    text = str(value or '').lower()
+    text = re.sub(r'[\s.()\-_/]+', '', text)
+
+    corrections = {
+        'สเพยาเสพติด': 'เสพยาเสพติด',
+        'เสพยาสเพติด': 'เสพยาเสพติด',
+        'อาวุธปิน': 'อาวุธปืน',
+        'ปืนเถื่อน': 'อาวุธปืน',
+        'ขายยาเสพติด': 'จำหน่ายยาเสพติด',
+        'ค้ายาเสพติด': 'จำหน่ายยาเสพติด',
+    }
+    for old, new in corrections.items():
+        text = text.replace(old, new)
+    return text
+
+
+CASE_CATEGORY_ALIASES = {
+    'เสพยาเสพติด': (
+        'เสพยาเสพติด', 'เสพยา', 'เสพเมทแอมเฟตามีน',
+        'เสพยาบ้า', 'เสพไอซ์', 'ผู้ขับขี่เสพ',
+    ),
+    'จำหน่ายยาเสพติด': (
+        'จำหน่ายยาเสพติด', 'มีไว้เพื่อจำหน่าย',
+        'ครอบครองเพื่อจำหน่าย', 'ขายยาเสพติด', 'ค้ายาเสพติด',
+    ),
+    'ครอบครองยาเสพติด': (
+        'ครอบครองยาเสพติด', 'มียาเสพติดไว้ในครอบครอง',
+        'มีไว้ในครอบครอง', 'ครอบครองโดยไม่ได้รับอนุญาต',
+    ),
+    'อาวุธปืน': (
+        'อาวุธปืน', 'พกพาอาวุธปืน',
+        'เครื่องกระสุนปืน', 'ปืนและเครื่องกระสุน',
+    ),
+    'การพนัน': (
+        'การพนัน', 'ลักลอบเล่นการพนัน', 'ทายผลฟุตบอล',
+        'พนันออนไลน์', 'บาคาร่า', 'สล็อต',
+    ),
+    'หมายจับ': (
+        'หมายจับ', 'จับกุมตามหมายจับ',
+    ),
+}
+
+
+def resolve_case_category(query: str) -> tuple[Optional[str], tuple[str, ...]]:
+    key = _case_text(query)
+
+    checks = [
+        ('จำหน่ายยาเสพติด', ('จำหน่าย', 'ขายยา', 'ค้ายา', 'เพื่อจำหน่าย')),
+        ('เสพยาเสพติด', ('เสพยา', 'ผู้ขับขี่เสพ')),
+        ('ครอบครองยาเสพติด', ('ครอบครองยา', 'มีไว้ในครอบครอง')),
+        ('อาวุธปืน', ('อาวุธปืน', 'ปืน', 'เครื่องกระสุน')),
+        ('การพนัน', ('การพนัน', 'พนัน', 'ทายผล', 'บาคาร่า', 'สล็อต')),
+        ('หมายจับ', ('หมายจับ',)),
+    ]
+
+    for category, tokens in checks:
+        if any(_case_text(token) in key for token in tokens):
+            return category, CASE_CATEGORY_ALIASES[category]
+
+    if 'ยาเสพติด' in key or key == 'ยา':
+        return 'ยาเสพติดทั้งหมด', (
+            'ยาเสพติด', 'เมทแอมเฟตามีน', 'ยาบ้า', 'ไอซ์',
+            'เฮโรอีน', 'เคตามีน', 'กัญชา',
+        )
+
+    return None, ()
+
+
+def search_case_category(query: str, data: list):
+    category, aliases = resolve_case_category(query)
+    if not category:
+        return None, [], 0
+
+    hits = []
+    for record in data:
+        charge = _case_text(record.get('charge', ''))
+        if not any(_case_text(alias) in charge for alias in aliases):
+            continue
+
+        if category == 'เสพยาเสพติด':
+            if 'เสพ' not in charge:
+                continue
+
+        elif category == 'จำหน่ายยาเสพติด':
+            if not any(token in charge for token in (
+                'จำหน่าย', 'เพื่อจำหน่าย', 'ขายยาเสพติด', 'ค้ายาเสพติด'
+            )):
+                continue
+
+        elif category == 'ครอบครองยาเสพติด':
+            if 'จำหน่าย' in charge:
+                continue
+            if 'ครอบครอง' not in charge and 'มีไว้ในครอบครอง' not in charge:
+                continue
+
+        hits.append(record)
+
+    ordered = _sort(hits)
+    return category, ordered[:DETAIL_LIMIT], len(ordered)
 
 
 def monthly(month_num: int, year_be: int, data: list) -> list:
@@ -340,20 +484,19 @@ def _row(label: str, value: str) -> dict:
 
 
 def build_bubble(rec: dict) -> dict:
-    color           = record_color(rec)
-    name            = rec.get('name','-')
-    nickname        = rec.get('nickname','')
-    charge          = rec.get('charge','-')
-    grp             = rec.get('group','')
-    date            = rec.get('date','-')
-    location        = rec.get('location','') or '-'
-    evidence        = rec.get('evidence','') or '-'
-    age             = rec.get('age','') or '-'
-    image_url       = rec.get('image_url')
-    record_file_url = rec.get('record_file_url')
-    month_abbr      = rec.get('month_abbr','')
-    year_be         = rec.get('year_be','')
-    period          = f"{month_abbr} {year_be}".strip() or rec.get('sheet','')
+    color      = record_color(rec)
+    name       = rec.get('name','-')
+    nickname   = rec.get('nickname','')
+    charge     = rec.get('charge','-')
+    grp        = rec.get('group','')
+    date       = rec.get('date','-')
+    location   = rec.get('location','') or '-'
+    evidence   = rec.get('evidence','') or '-'
+    age        = rec.get('age','') or '-'
+    image_url  = rec.get('image_url')
+    month_abbr = rec.get('month_abbr','')
+    year_be    = rec.get('year_be','')
+    period     = f"{month_abbr} {year_be}".strip() or rec.get('sheet','')
 
     header = [_t(name, weight='bold', size='md', color='#FFFFFF', wrap=True)]
     if nickname:
@@ -388,82 +531,18 @@ def build_bubble(rec: dict) -> dict:
             'contents':body,
         },
     }
-    # แสดงรูปภาพผู้ต้องหา (จาก Google Drive)
     if image_url:
         bubble['hero'] = {
             'type':'image','url':image_url,
             'size':'full','aspectRatio':'4:3','aspectMode':'cover',
         }
-    # ปุ่มลิ้งก์ไฟล์บันทึกจับกุม (ก.ค.69+)
-    if record_file_url:
-        bubble['footer'] = {
-            'type':'box','layout':'vertical','spacing':'none',
-            'paddingAll':'10px',
-            'contents':[{
-                'type':'button',
-                'style':'primary',
-                'color':color,
-                'height':'sm',
-                'action':{
-                    'type':'uri',
-                    'label':'📄 ดูไฟล์บันทึกจับกุม',
-                    'uri': record_file_url,
-                }
-            }]
-        }
     return bubble
 
 
 def build_carousel(records: list, alt: str) -> FlexMessage:
-    try:
-        bubbles   = [build_bubble(r) for r in records[:10]]
-        container = {'type':'carousel','contents':bubbles} if len(bubbles) > 1 else bubbles[0]
-        return FlexMessage(alt_text=alt[:400], contents=FlexContainer.from_dict(container))
-    except Exception as e:
-        log.error(f'[build_carousel] Flex error: {e}', exc_info=True)
-        # Fallback: plain text list
-        lines = []
-        for i, r in enumerate(records[:10], 1):
-            lines.append(f"{i}. {r.get('name','-')} — {(r.get('charge','') or '')[:20]}")
-        return TextMessage(text='\n'.join(lines))
-
-
-def build_name_results(kw: str, rows: list, total: int) -> list:
-    """สร้าง message list สำหรับแสดงผลค้นหาชื่อ:
-    - header text (จำนวนที่พบ)
-    - Flex carousel (10 รายการแรกพร้อมรูปภาพ)
-    - text list (รายการที่ 11-30)
-    """
-    msgs = []
-
-    # Header
-    msgs.append(TextMessage(
-        text=f"🔍 ค้นหา: {kw}\nพบทั้งหมด {total} ราย (แสดง {len(rows)} ล่าสุด)"
-    ))
-
-    # Flex carousel (10 รายการแรก) พร้อมรูปภาพถ้ามี
-    if rows[:10]:
-        msgs.append(build_carousel(rows[:10], f"ค้นหา: {kw}"))
-
-    # Text list สำหรับรายการที่ 11-30
-    remaining = rows[10:30]
-    if remaining:
-        lines = [f"📋 รายชื่อเพิ่มเติม ({len(remaining)} ราย):"]
-        for i, r in enumerate(remaining, 11):
-            name       = r.get('name', '-')
-            charge     = (r.get('charge', '') or '')[:22]
-            month_abbr = r.get('month_abbr', '')
-            year_be    = r.get('year_be', '')
-            period     = f"{month_abbr} {year_be}".strip()
-            line       = f"{i}. {name}"
-            if charge:
-                line += f" — {charge}"
-            if period:
-                line += f" ({period})"
-            lines.append(line)
-        msgs.append(TextMessage(text='\n'.join(lines)))
-
-    return msgs
+    bubbles   = [build_bubble(r) for r in records[:10]]
+    container = {'type':'carousel','contents':bubbles} if len(bubbles) > 1 else bubbles[0]
+    return FlexMessage(alt_text=alt, contents=FlexContainer.from_dict(container))
 
 
 def build_summary_flex(title: str, total: int, cat: dict, records: list) -> FlexMessage:
@@ -534,15 +613,476 @@ def build_summary_flex(title: str, total: int, cat: dict, records: list) -> Flex
             ]
         }
     }
-    try:
-        return FlexMessage(alt_text=f'{title}: {total} ราย',
-                           contents=FlexContainer.from_dict(bubble))
-    except Exception as e:
-        log.error(f'[build_summary_flex] Flex error: {e}', exc_info=True)
-        lines = [f'🚔 {title} — {total} ราย']
-        for i, r in enumerate(records[:10], 1):
-            lines.append(f"{i}. {r.get('name','-')}")
-        return TextMessage(text='\n'.join(lines))
+    return FlexMessage(alt_text=f'{title}: {total} ราย',
+                       contents=FlexContainer.from_dict(bubble))
+
+
+
+# ─── Staff / operation team helpers ───────────────────────────────────────────
+BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
+
+
+def _search_key(value: str) -> str:
+    """ทำข้อความให้เหมาะกับการค้นหา: ตัดช่องว่าง จุด และขีด"""
+    return re.sub(r'[\\s.()\\-_/]+', '', str(value or '')).lower()
+
+
+def search_staff(keyword: str, staff: list) -> list:
+    """ค้นหาบุคลากรจากชื่อ ตำแหน่ง ชื่อเล่น หรือเบอร์โทร"""
+    key = _search_key(keyword)
+    phone_key = re.sub(r'\D', '', str(keyword or ''))
+    if not key:
+        return []
+
+    results = []
+    for person in staff:
+        haystacks = (
+            person.get('name', ''),
+            person.get('position', ''),
+            person.get('nickname', ''),
+            person.get('phone', ''),
+        )
+        text_match = any(key in _search_key(value) for value in haystacks)
+        person_phone = re.sub(r'\D', '', person.get('phone', ''))
+        phone_match = bool(phone_key and len(phone_key) >= 4 and phone_key in person_phone)
+        if text_match or phone_match:
+            results.append(person)
+
+    return sort_staff(results)
+
+
+def _rank_weight(name: str, position: str) -> int:
+    """เรียงยศ/ตำแหน่งผู้บังคับบัญชาก่อน"""
+    text = f"{name} {position}".replace(" ", "")
+    rules = [
+        ("ผกก.", 10),
+        ("รองผกก.", 20),
+        ("สว.", 30),
+        ("รองสว.", 40),
+        ("ร.ต.อ.", 50),
+        ("ร.ต.ท.", 60),
+        ("ร.ต.ต.", 70),
+        ("ด.ต.", 80),
+        ("จ.ส.ต.", 90),
+        ("ส.ต.อ.", 100),
+        ("ส.ต.ท.", 110),
+        ("ส.ต.ต.", 120),
+    ]
+    for token, weight in rules:
+        if token.replace(" ", "") in text:
+            return weight
+    return 999
+
+
+def sort_staff(people: list) -> list:
+    """เรียงผู้ควบคุมชุดก่อน แล้วตามลำดับในชีต ชป."""
+    return sorted(
+        people,
+        key=lambda p: (
+            0 if p.get('controller') else 1,
+            int(p.get('team_order', 999) or 999),
+            _rank_weight(p.get('name', ''), p.get('position', '')),
+            _search_key(p.get('name', '')),
+        )
+    )
+
+
+def staff_by_team(team: int, staff: list) -> list:
+    """สมาชิกทั้งชุด รวมผู้ควบคุมชุด"""
+    return sort_staff([p for p in staff if p.get('team') == team])
+
+
+def duty_staff_by_team(team: int, staff: list) -> list:
+    """สมาชิกผู้เข้าเวร ไม่รวมผู้ควบคุมชุด"""
+    members = staff_by_team(team, staff)
+    if any(p.get('controller') for p in members):
+        return [p for p in members if not p.get('controller')]
+    return members[1:] if len(members) > 1 else []
+
+
+def parse_team_command(text: str) -> Optional[int]:
+    """รองรับ ชุดปฏิบัติการ1 / ชป.ที่1 / ชป.1 / ชุด1"""
+    compact = re.sub(r'\s+', '', text.strip())
+    m = re.fullmatch(
+        r'(?:ชุดปฏิบัติการ(?:ที่)?|ชป\.?(?:ที่)?|ชุด(?:ที่)?)[.]?([12])',
+        compact,
+        re.IGNORECASE
+    )
+    return int(m.group(1)) if m else None
+
+
+THAI_MONTH_LOOKUP = {
+    'ม.ค.': 1, 'มค': 1, 'มกราคม': 1,
+    'ก.พ.': 2, 'กพ': 2, 'กุมภาพันธ์': 2,
+    'มี.ค.': 3, 'มีค': 3, 'มีนาคม': 3,
+    'เม.ย.': 4, 'เมย': 4, 'เมษายน': 4,
+    'พ.ค.': 5, 'พค': 5, 'พฤษภาคม': 5,
+    'มิ.ย.': 6, 'มิย': 6, 'มิถุนายน': 6,
+    'ก.ค.': 7, 'กค': 7, 'กรกฎาคม': 7,
+    'ส.ค.': 8, 'สค': 8, 'สิงหาคม': 8,
+    'ก.ย.': 9, 'กย': 9, 'กันยายน': 9,
+    'ต.ค.': 10, 'ตค': 10, 'ตุลาคม': 10,
+    'พ.ย.': 11, 'พย': 11, 'พฤศจิกายน': 11,
+    'ธ.ค.': 12, 'ธค': 12, 'ธันวาคม': 12,
+}
+THAI_MONTH_FULL = {
+    1: 'มกราคม', 2: 'กุมภาพันธ์', 3: 'มีนาคม', 4: 'เมษายน',
+    5: 'พฤษภาคม', 6: 'มิถุนายน', 7: 'กรกฎาคม', 8: 'สิงหาคม',
+    9: 'กันยายน', 10: 'ตุลาคม', 11: 'พฤศจิกายน', 12: 'ธันวาคม',
+}
+THAI_WEEKDAY = {
+    0: 'วันจันทร์', 1: 'วันอังคาร', 2: 'วันพุธ', 3: 'วันพฤหัสบดี',
+    4: 'วันศุกร์', 5: 'วันเสาร์', 6: 'วันอาทิตย์',
+}
+
+
+def _normalise_be_year(year: Optional[int], fallback_ad: int) -> int:
+    if year is None:
+        return fallback_ad
+    if year < 100:
+        year += 2500
+    if year >= 2400:
+        year -= 543
+    return year
+
+
+def parse_duty_date(text: str) -> Optional[date]:
+    """
+    ตรวจจับคำถามเกี่ยวกับเวรและวัน เช่น:
+    เวร 20 ก.ค.69 / เวรวันที่ 20 / ใครเข้าเวร 20/7/69
+    วันนี้ใครเข้าเวร / เวรพรุ่งนี้ / มะรืนใครอยู่เวร
+    """
+    raw = text.strip()
+    compact = re.sub(r'\s+', '', raw)
+    now = datetime.now(BANGKOK_TZ).date()
+
+    duty_intent = re.search(
+        r'(เวร|เข้าเวร|อยู่เวร|ปฏิบัติหน้าที่|ชุดไหนทำงาน|ใครทำงาน)',
+        raw
+    )
+    if not duty_intent:
+        return None
+
+    if 'มะรืน' in compact:
+        return now + timedelta(days=2)
+    if 'พรุ่งนี้' in compact:
+        return now + timedelta(days=1)
+    if 'วันนี้' in compact:
+        return now
+    if 'เมื่อวาน' in compact:
+        return now - timedelta(days=1)
+
+    # 20/7/69, 20-7-2569, 20.7.69
+    m = re.search(r'(?<!\d)(\d{1,2})\s*[/.-]\s*(\d{1,2})\s*[/.-]\s*(\d{2,4})(?!\d)', raw)
+    if m:
+        day, month, year = map(int, m.groups())
+        year_ad = _normalise_be_year(year, now.year)
+        try:
+            return date(year_ad, month, day)
+        except ValueError:
+            return None
+
+    # 20 ก.ค. 69 / วันที่ 20 กรกฎาคม 2569
+    month_tokens = sorted(THAI_MONTH_LOOKUP, key=len, reverse=True)
+    month_pattern = '|'.join(re.escape(x) for x in month_tokens)
+    m = re.search(
+        rf'(?<!\d)(\d{{1,2}})\s*(?:วันที่)?\s*({month_pattern})\s*\.?\s*(\d{{2,4}})?',
+        raw
+    )
+    if m:
+        day = int(m.group(1))
+        token = m.group(2).rstrip('.')
+        month = THAI_MONTH_LOOKUP.get(m.group(2), THAI_MONTH_LOOKUP.get(token))
+        year = int(m.group(3)) if m.group(3) else None
+        year_ad = _normalise_be_year(year, now.year)
+        try:
+            return date(year_ad, month, day)
+        except (ValueError, TypeError):
+            return None
+
+    # เวรวันที่ 20 / ใครเข้าเวรวัน 20 / เวร 20
+    m = re.search(r'(?:วันที่|วัน|เวร)\s*(\d{1,2})(?!\d)', raw)
+    if not m:
+        m = re.search(r'เข้าเวร\s*(\d{1,2})(?!\d)', raw)
+    if m:
+        day = int(m.group(1))
+        try:
+            return date(now.year, now.month, day)
+        except ValueError:
+            return None
+
+    return None
+
+
+def duty_title(duty_date: date, team: int) -> str:
+    be_year = duty_date.year + 543
+    weekday = THAI_WEEKDAY[duty_date.weekday()]
+    parity = 'วันคู่' if duty_date.day % 2 == 0 else 'วันคี่'
+    return (
+        f"เวร{weekday}ที่ {duty_date.day} "
+        f"{THAI_MONTH_FULL[duty_date.month]} {be_year} "
+        f"({parity}) — ชุดปฏิบัติการที่ {team}"
+    )
+
+
+def _phone_uri(phone: str) -> Optional[str]:
+    digits = re.sub(r'\D', '', phone or '')
+    return f"tel:{digits}" if len(digits) >= 9 else None
+
+
+def build_staff_bubble(person: dict) -> dict:
+    team = person.get('team', 0)
+    is_controller = bool(person.get('controller'))
+    if team in (1, 2):
+        team_text = (
+            f'ผู้ควบคุมชุดปฏิบัติการที่ {team}'
+            if is_controller else f'ชุดปฏิบัติการที่ {team}'
+        )
+    else:
+        team_text = 'ฝ่ายสืบสวน'
+
+    if is_controller:
+        duty_text = 'ผู้ควบคุมชุด — ไม่เข้าเวร'
+    else:
+        duty_text = 'เข้าเวรวันคู่' if team == 1 else 'เข้าเวรวันคี่' if team == 2 else '-'
+    color = '#1565C0' if team == 1 else '#7B1FA2' if team == 2 else '#37474F'
+
+    name = person.get('name', '-') or '-'
+    position = person.get('position', '-') or '-'
+    nickname = person.get('nickname', '-') or '-'
+    phone = person.get('phone', '-') or '-'
+    image_url = person.get('image_url')
+    tel_uri = _phone_uri(phone)
+
+    bubble = {
+        'type': 'bubble',
+        'size': 'kilo',
+        'header': {
+            'type': 'box',
+            'layout': 'vertical',
+            'backgroundColor': color,
+            'paddingAll': '13px',
+            'contents': [
+                _t(name, weight='bold', size='md', color='#FFFFFF', wrap=True),
+                _t(team_text, size='xs', color='#FFFFFFcc', margin='xs'),
+            ],
+        },
+        'body': {
+            'type': 'box',
+            'layout': 'vertical',
+            'paddingAll': '12px',
+            'spacing': 'sm',
+            'contents': [
+                _row('👮 ตำแหน่ง', position),
+                _row('😊 ชื่อเล่น', nickname),
+                _row('📞 เบอร์โทร', phone),
+                _row('📅 เวร', duty_text),
+            ],
+        },
+    }
+
+    if image_url:
+        bubble['hero'] = {
+            'type': 'image',
+            'url': image_url,
+            'size': 'full',
+            'aspectRatio': '3:4',
+            'aspectMode': 'cover',
+            'action': {
+                'type': 'uri',
+                'label': 'เปิดรูปภาพ',
+                'uri': image_url,
+            },
+        }
+
+    if tel_uri:
+        bubble['footer'] = {
+            'type': 'box',
+            'layout': 'vertical',
+            'paddingAll': '10px',
+            'contents': [{
+                'type': 'button',
+                'style': 'primary',
+                'height': 'sm',
+                'action': {
+                    'type': 'uri',
+                    'label': f'โทร {phone}',
+                    'uri': tel_uri,
+                },
+            }],
+        }
+
+    return bubble
+
+
+def build_staff_carousels(people: list, title: str) -> list:
+    """แสดงบุคลากรทั้งหมด เป็น carousel ละไม่เกิน 10 คน"""
+    if not people:
+        return [TextMessage(text=f"❌ ไม่พบข้อมูล {title}")]
+
+    people = sort_staff(people)
+    messages = [
+        TextMessage(text=f"👮 {title}\nพบทั้งหมด {len(people)} นาย")
+    ]
+
+    # LINE carousel จำกัด 10 bubbles; LINE reply จำกัด 5 messages
+    for start in range(0, min(len(people), 40), 10):
+        chunk = people[start:start + 10]
+        container = {
+            'type': 'carousel',
+            'contents': [build_staff_bubble(p) for p in chunk]
+        }
+        messages.append(
+            FlexMessage(
+                alt_text=f'{title} ({start + 1}-{start + len(chunk)})',
+                contents=FlexContainer.from_dict(container)
+            )
+        )
+
+    return messages[:5]
+
+
+def build_main_menu() -> FlexMessage:
+    bubble = {
+        'type': 'bubble',
+        'size': 'mega',
+        'header': {
+            'type': 'box',
+            'layout': 'vertical',
+            'backgroundColor': '#173B57',
+            'paddingAll': '18px',
+            'contents': [
+                _t('🚔 เมนู LINE Bot สน.บางชัน',
+                   color='#FFFFFF', weight='bold', size='lg'),
+                _t('แตะเมนูเพื่อส่งคำสั่ง',
+                   color='#FFFFFFcc', size='sm', margin='sm'),
+            ],
+        },
+        'body': {
+            'type': 'box',
+            'layout': 'vertical',
+            'spacing': 'sm',
+            'paddingAll': '14px',
+            'contents': [
+                {
+                    'type': 'button', 'style': 'primary',
+                    'action': {'type': 'message', 'label': '🚔 เวรวันนี้', 'text': 'เวรวันนี้'}
+                },
+                {
+                    'type': 'button', 'style': 'secondary',
+                    'action': {'type': 'message', 'label': '👥 ชุดปฏิบัติการที่ 1', 'text': 'ชป.1'}
+                },
+                {
+                    'type': 'button', 'style': 'secondary',
+                    'action': {'type': 'message', 'label': '👥 ชุดปฏิบัติการที่ 2', 'text': 'ชป.2'}
+                },
+                {
+                    'type': 'button', 'style': 'secondary',
+                    'action': {'type': 'message', 'label': '📊 สถิติคดี', 'text': 'สถิติ'}
+                },
+                {
+                    'type': 'button',
+                    'action': {'type': 'message', 'label': '❓ วิธีใช้งาน', 'text': 'ช่วยเหลือ'}
+                },
+            ],
+        },
+    }
+    return FlexMessage(
+        alt_text='เมนู LINE Bot สน.บางชัน',
+        contents=FlexContainer.from_dict(bubble)
+    )
+
+
+# ─── Continuation text helpers ────────────────────────────────────────────────
+LINE_TEXT_LIMIT = 4800  # เผื่อจากขีดจำกัดข้อความ LINE 5,000 ตัวอักษร
+
+
+def _record_text_line(rec: dict, index: int) -> str:
+    """แปลงข้อมูลหนึ่งรายการเป็นข้อความสั้นสำหรับรายการที่เกิน 10 ราย"""
+    name = rec.get('name', '-') or '-'
+    charge = rec.get('charge', '') or ''
+    date = rec.get('date', '') or ''
+    location = rec.get('location', '') or ''
+
+    parts = [f"{index}. {name}"]
+    if charge:
+        parts.append(f"   ข้อหา: {charge}")
+    if date:
+        parts.append(f"   วันที่: {date}")
+    if location:
+        parts.append(f"   สถานที่: {location}")
+    return "\n".join(parts)
+
+
+def _chunk_text(header: str, blocks: list[str]) -> list[TextMessage]:
+    """แบ่งข้อความยาวเป็นหลายข้อความ โดยไม่เกินขีดจำกัดของ LINE"""
+    if not blocks:
+        return []
+
+    messages = []
+    current = header.strip()
+
+    for block in blocks:
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) > LINE_TEXT_LIMIT and current:
+            messages.append(TextMessage(text=current))
+            current = block
+        else:
+            current = candidate
+
+    if current:
+        messages.append(TextMessage(text=current))
+
+    return messages
+
+
+def build_remaining_text_messages(records: list, start_index: int = 11,
+                                  title: str = "รายชื่อเพิ่มเติม") -> list:
+    """สร้างข้อความธรรมดาสำหรับข้อมูลตั้งแต่รายการที่ 11 เป็นต้นไป"""
+    if not records:
+        return []
+
+    blocks = [
+        _record_text_line(rec, start_index + offset)
+        for offset, rec in enumerate(records)
+    ]
+    header = f"📋 {title}\nแสดงรายการที่ {start_index}-{start_index + len(records) - 1}"
+    return _chunk_text(header, blocks)
+
+
+def build_summary_messages(title: str, rows: list) -> list:
+    """
+    ส่ง Flex สรุป 10 รายแรก และรายการที่เหลือเป็นข้อความธรรมดา
+    LINE reply ได้สูงสุด 5 messages จึงใช้ Flex 1 + ข้อความต่อเนื่องสูงสุด 4
+    """
+    messages = [
+        build_summary_flex(title, len(rows), _cat_count(rows), rows)
+    ]
+    remaining = build_remaining_text_messages(
+        rows[10:],
+        start_index=11,
+        title=f"{title} — รายการต่อจากการ์ด"
+    )
+    messages.extend(remaining[:4])
+    return messages[:5]
+
+
+def build_search_messages(prefix: str, rows: list, total: int, alt: str) -> list:
+    """ผลค้นหา: ข้อความสรุป + การ์ดสูงสุด 10 + รายการที่เหลือเป็นข้อความ"""
+    messages = [
+        TextMessage(
+            text=f"{prefix}\nพบทั้งหมด {total} ราย "
+                 f"(แสดงการ์ด {min(len(rows), 10)} รายแรก)"
+        ),
+        build_carousel(rows[:10], alt),
+    ]
+    remaining = build_remaining_text_messages(
+        rows[10:],
+        start_index=11,
+        title="ผลค้นหาเพิ่มเติม"
+    )
+    messages.extend(remaining[:3])
+    return messages[:5]
 
 
 # ─── Command router ───────────────────────────────────────────────────────────
@@ -561,22 +1101,29 @@ MONTH_YEAR_DIRECT_RE = re.compile(
 HELP_TEXT = (
     "🚔 คำสั่ง LINE Bot สน.บางชัน\n"
     "━━━━━━━━━━━━━━━━━━\n"
-    "🔍 bot ค้นหา <ชื่อ>\n"
-    "   ค้นหาผู้ต้องหาตามชื่อ\n\n"
-    "📍 bot สถานที่ <สถานที่>\n"
-    "   ค้นหาตามสถานที่จับกุม\n\n"
-    "📅 bot เดือน ก.ค. 69\n"
-    "   สรุปผลจับกุมรายเดือน\n\n"
-    "📆 bot ปี 2569\n"
-    "   สรุปผลจับกุมรายปี\n\n"
-    "📦 bot ของกลาง <สิ่งของ>\n"
-    "   ค้นหาตามของกลาง\n\n"
-    "⚖️ bot ข้อหา <ข้อหา>\n"
-    "   ค้นหาตามข้อหา\n\n"
-    "📊 bot สถิติ\n"
-    "   ดูสถิติภาพรวม\n\n"
-    "🔄 bot รีเฟรช\n"
-    "   โหลดข้อมูลใหม่จาก Apps Script\n"
+    "🏠 เมนู\n"
+    "   เปิดเมนูหลักแบบกดเลือกได้\n\n"
+    "👮 <ชื่อ/ตำแหน่ง/ชื่อเล่น/เบอร์โทร>\n"
+    "   เช่น ชนะชัย, รอง ผกก., หนึ่ง, 6780\n\n"
+    "👥 ชป.1 / ชป.ที่2 / ชุด1\n"
+    "   แสดงสมาชิกชุดปฏิบัติการ\n\n"
+    "🗓️ ค้นหาเวรได้หลายรูปแบบ\n"
+    "   เวรวันนี้, ใครเข้าเวรพรุ่งนี้\n"
+    "   เวร 20 ก.ค.69, เข้าเวร 20/7/69\n"
+    "   วันคู่ = ชุด 1, วันคี่ = ชุด 2\n\n"
+    "🔍 ค้นหา <ชื่อผู้ต้องหา>\n"
+    "📍 สถานที่ <สถานที่จับกุม>\n"
+    "📅 เดือน ก.ค. 69\n"
+    "📆 ปี 2569\n"
+    "📦 ของกลาง <สิ่งของ>\n"
+    "⚖️ ข้อหา <ข้อหา>\n"
+    "🚨 คดี <ประเภทคดี>\n"
+    "   เช่น คดีเสพยาเสพติด, คดีจำหน่ายยาเสพติด\n"
+    "   คดีอาวุธปืน, คดีการพนัน\n"
+    "🆔 รหัสแชต\n"
+    "   ใช้ดูรหัสสำหรับตั้งค่าแจ้งเตือนอัตโนมัติ\n"
+    "📊 สถิติ\n"
+    "🔄 รีเฟรช\n"
     "━━━━━━━━━━━━━━━━━━\n"
     "💡 ใช้ในกลุ่ม: ต้องพิมพ์ bot นำหน้า"
 )
@@ -600,17 +1147,18 @@ def _cat_count(rows: list) -> dict:
 
 
 def handle_message(text: str) -> list:
-    data = get_data()
-    t    = normalise_text(text)  # normalize ก่อนเข้า logic ทั้งหมด
+    t = text.strip()
+    log.info(f'[message] text={t!r}')
+    # โหลดบุคลากรก่อน เพราะมีขนาดเล็กและใช้เวลาสั้น
+    staff = get_staff(wait_if_empty=True)
+    data = get_arrests()
+    log.info(
+        f'[message] arrest_records={len(data)} staff_records={len(staff)}'
+    )
 
-    # ── ยังไม่มีข้อมูลเลย (ครั้งแรก) ──
-    # ถ้า data ว่าง = ยังไม่เคย load สำเร็จแม้แต่ครั้งเดียว
-    # ถ้า data มีข้อมูล (stale หรือใหม่) = ใช้ได้เลย ไม่ขึ้น loading message
-    if not data:
-        return [TextMessage(text=(
-            "⏳ ระบบกำลังโหลดข้อมูลจาก Google Sheets\n"
-            "กรุณาลองใหม่อีกครั้งใน 1-2 นาที"
-        ))]
+    # ── เมนูหลัก ──
+    if re.match(r'^(เมนู|menu|หน้าหลัก|home)$', t, re.IGNORECASE):
+        return [build_main_menu()]
 
     # ── ช่วยเหลือ ──
     if re.match(r'^(ช่วย|help|ช่วยเหลือ|คำสั่ง)$', t, re.IGNORECASE):
@@ -618,6 +1166,8 @@ def handle_message(text: str) -> list:
 
     # ── สถิติ ──
     if re.match(r'^สถิติ$', t):
+        if not data:
+            return [TextMessage(text="⏳ ข้อมูลคดีกำลังโหลด กรุณาลองใหม่อีกครั้งใน 1-2 นาที")]
         total, by_cat, by_year = statistics(data)
         top = sorted(by_year.items(), reverse=True)[:5]
         yr_txt = '\n'.join(f"  ปี {yr}: {cnt:,} ราย" for yr, cnt in top)
@@ -633,17 +1183,70 @@ def handle_message(text: str) -> list:
 
     # ── รีเฟรช ──
     if re.match(r'^(รีเฟรช|refresh|โหลดใหม่)$', t, re.IGNORECASE):
-        threading.Thread(target=lambda: get_data(force=True), daemon=True).start()
-        return [TextMessage(text="🔄 กำลังโหลดข้อมูลใหม่จาก Apps Script...")]
+        _start_staff_fetch()
+        _start_arrest_fetch()
+        return [TextMessage(text=(
+            "🔄 เริ่มโหลดข้อมูลใหม่แล้ว\n"
+            "• บุคลากรจะพร้อมก่อน\n"
+            "• ข้อมูลคดีโหลดแยกในพื้นหลัง"
+        ))]
+
+    # ── ชุดปฏิบัติการ ──
+    team = parse_team_command(t)
+    if team:
+        people = staff_by_team(team, staff)
+        return build_staff_carousels(
+            people, f"ชุดปฏิบัติการที่ {team}"
+        )
+
+    # ── เวรวันคู่/วันคี่: ค้นจากฐานบุคลากรก่อนเสมอ ──
+    duty_date = parse_duty_date(t)
+    if duty_date:
+        team = 1 if duty_date.day % 2 == 0 else 2
+        people = duty_staff_by_team(team, staff)
+        title = duty_title(duty_date, team) + " (ไม่รวมผู้ควบคุมชุด)"
+        return build_staff_carousels(
+            people,
+            title
+        )
+
+    # ── ค้นหาบุคลากรแบบระบุคำสั่ง ──
+    m = re.match(r'^(?:บุคลากร|เจ้าหน้าที่|ตำรวจ)\s+(.+)$', t)
+    if m:
+        keyword = m.group(1).strip()
+        people = search_staff(keyword, staff)
+        if not people:
+            return [TextMessage(text=f"❌ ไม่พบบุคลากร '{keyword}'")]
+        return build_staff_carousels(
+            people, f"ผลค้นหาบุคลากร: {keyword}"
+        )
+
+    # ── ค้นหาบุคลากรอัตโนมัติจากชื่อ/ตำแหน่ง/ชื่อเล่น/เบอร์โทร ──
+    # ทำก่อนตรวจฐานคดี เพื่อให้ค้นหาบุคลากรได้ แม้ข้อมูลคดียังโหลดไม่เสร็จ
+    if len(t) >= 2:
+        people = search_staff(t, staff)
+        if people:
+            return build_staff_carousels(
+                people, f"ผลค้นหาบุคลากร: {t}"
+            )
+
+    # คำสั่งตั้งแต่ส่วนนี้ต้องใช้ฐานข้อมูลคดี
+    if not data:
+        return [TextMessage(text=(
+            "⏳ ข้อมูลคดีกำลังโหลดจาก Google Sheets\n"
+            "ฐานข้อมูลบุคลากรใช้งานได้แล้ว แต่ข้อมูลคดีอาจใช้เวลา 1-2 นาที"
+        ))]
 
     # ── ค้นหาชื่อ ──
     m = re.match(r'^ค้นหา\s+(.+)$', t)
     if m:
-        kw = normalise_text(m.group(1))
+        kw = m.group(1).strip()
         rows, total = search_name(kw, data)
         if not rows:
             return [TextMessage(text=f"❌ ไม่พบ '{kw}' ในระบบ")]
-        return build_name_results(kw, rows, total)
+        return build_search_messages(
+            f"🔍 ค้นหา: {kw}", rows, total, f"ค้นหา: {kw}"
+        )
 
     # ── เดือน (explicit) ──
     m = re.match(r'^เดือน\s+(.+)$', t)
@@ -654,7 +1257,7 @@ def handle_message(text: str) -> list:
             if not rows:
                 return [TextMessage(text="❌ ไม่พบข้อมูลเดือนนั้น")]
             abbr = MONTH_NUM_TO_ABBR.get(mn, '')
-            return [build_summary_flex(f"สรุป {abbr} {yr}", len(rows), _cat_count(rows), rows)]
+            return build_summary_messages(f"สรุป {abbr} {yr}", rows)
         return [TextMessage(text="❓ รูปแบบเดือนไม่ถูกต้อง เช่น เดือน ก.ค. 69")]
 
     # ── เดือน/ปี พิมพ์ตรง ──
@@ -665,7 +1268,7 @@ def handle_message(text: str) -> list:
             if not rows:
                 return [TextMessage(text="❌ ไม่พบข้อมูลเดือนนั้น")]
             abbr = MONTH_NUM_TO_ABBR.get(mn, '')
-            return [build_summary_flex(f"สรุป {abbr} {yr}", len(rows), _cat_count(rows), rows)]
+            return build_summary_messages(f"สรุป {abbr} {yr}", rows)
 
     # ── ปี ──
     m = re.match(r'^ปี\s*(25[5-9]\d|26\d{2}|[5-9]\d)$', t)
@@ -675,52 +1278,132 @@ def handle_message(text: str) -> list:
         rows = yearly(ybe, data)
         if not rows:
             return [TextMessage(text=f"❌ ไม่พบข้อมูลปี {ybe}")]
-        return [build_summary_flex(f"สรุปปี {ybe}", len(rows), _cat_count(rows), rows)]
+        return build_summary_messages(f"สรุปปี {ybe}", rows)
 
     # ── สถานที่ (explicit) ──
     m = re.match(r'^สถานที่\s+(.+)$', t)
     if m:
-        kw = normalise_text(m.group(1))
+        kw = m.group(1).strip()
         rows, total = search_location(kw, data)
         if not rows:
             return [TextMessage(text=f"❌ ไม่พบสถานที่ '{kw}'")]
-        return [build_summary_flex(f"📍 {kw}", total, _cat_count(rows), rows)]
+        return build_summary_messages(f"📍 {kw}", rows)
 
     # ── สถานที่ (auto-detect prefix) ──
     if LOCATION_PREFIX_RE.match(t):
         rows, total = search_location(t, data)
         if rows:
-            return [build_summary_flex(f"📍 {t}", total, _cat_count(rows), rows)]
+            return build_summary_messages(f"📍 {t}", rows)
 
     # ── ของกลาง ──
     m = re.match(r'^ของกลาง\s+(.+)$', t)
     if m:
-        kw = normalise_text(m.group(1))
+        kw = m.group(1).strip()
         rows, total = search_evidence(kw, data)
         if not rows:
             return [TextMessage(text=f"❌ ไม่พบของกลาง '{kw}'")]
-        return [
-            TextMessage(text=f"📦 ของกลาง: {kw}\nพบทั้งหมด {total} ราย (แสดง {len(rows)} ล่าสุด)"),
-            build_carousel(rows[:10], f"ของกลาง: {kw}"),
+        return build_search_messages(
+            f"📦 ของกลาง: {kw}", rows, total, f"ของกลาง: {kw}"
+        )
+
+    # ── ค้นหาแยกตามประเภทคดี ──
+    m = re.match(
+        r'^(?:ค้นหา\s*)?(?:คดี|ประเภทคดี|คดีประเภท)\s*[:：]?\s*(.+)$',
+        t
+    )
+    category_query = m.group(1).strip() if m else t
+    category, rows, total = search_case_category(category_query, data)
+
+    direct_categories = (
+        'เสพยาเสพติด', 'สเพยาเสพติด', 'จำหน่ายยาเสพติด',
+        'ครอบครองยาเสพติด', 'อาวุธปืน', 'การพนัน',
+        'ยาเสพติด', 'หมายจับ'
+    )
+    is_category_command = (
+        m is not None
+        or any(_case_text(word) == _case_text(t) for word in direct_categories)
+    )
+
+    if is_category_command:
+        if not category:
+            return [TextMessage(text=(
+                f"❓ ยังไม่รู้จักประเภทคดี '{category_query}'\n"
+                "ตัวอย่าง: คดีเสพยาเสพติด, คดีจำหน่ายยาเสพติด, "
+                "คดีครอบครองยาเสพติด, คดีอาวุธปืน"
+            ))]
+        if not rows:
+            return [TextMessage(text=f"❌ ไม่พบคดีประเภท '{category}'")]
+
+        messages = [
+            TextMessage(text=(
+                f"🚨 คดี{category}\n"
+                f"พบทั้งหมด {total} ราย "
+                f"(แสดงการ์ด {min(len(rows), 10)} รายแรก)"
+            )),
+            build_carousel(rows[:10], f"คดี{category}"),
         ]
+        messages.extend(
+            build_remaining_text_messages(
+                rows[10:],
+                start_index=11,
+                title=f"คดี{category} — รายการเพิ่มเติม"
+            )[:3]
+        )
+        return messages[:5]
 
     # ── ข้อหา ──
     m = re.match(r'^ข้อหา\s+(.+)$', t)
     if m:
-        kw = normalise_text(m.group(1))
+        kw = m.group(1).strip()
         rows, total = search_charge(kw, data)
         if not rows:
             return [TextMessage(text=f"❌ ไม่พบข้อหา '{kw}'")]
-        return [build_summary_flex(f"⚖️ {kw}", total, _cat_count(rows), rows)]
+        return build_summary_messages(f"⚖️ {kw}", rows)
 
-    # ── fallback: ค้นหาชื่อ (พิมพ์ตรงๆ ไม่ต้องมีคำนำหน้า) ──
-    # รองรับ: 'สิทธิชัย', 'สร้อย', 'สร้อยสน', 'สิทธิชัย สร้อย'
+    # ── fallback: ลองค้นหาชื่อ (รองรับพิมพ์ชื่อตรงๆ ไม่ต้องมีคำนำหน้า) ──
     if len(t) >= 2:
         rows, total = search_name(t, data)
         if rows:
-            return build_name_results(t, rows, total)
+            return build_search_messages(
+                f"🔍 ค้นหา: {t}", rows, total, f"ค้นหา: {t}"
+            )
 
     return [TextMessage(text=f"❓ ไม่พบ '{t}' ในระบบ\nพิมพ์ bot ช่วยเหลือ เพื่อดูคำสั่งทั้งหมด")]
+
+
+# ─── Daily duty notification ─────────────────────────────────────────────────
+def build_daily_duty_messages(target_date: Optional[date] = None) -> list:
+    """สร้างข้อความเวรประจำวันสำหรับ reply หรือ push"""
+    duty_date = target_date or datetime.now(BANGKOK_TZ).date()
+    staff = get_staff(force=True, wait_if_empty=True)
+    team = 1 if duty_date.day % 2 == 0 else 2
+    people = duty_staff_by_team(team, staff)
+
+    title = duty_title(duty_date, team) + " (ไม่รวมผู้ควบคุมชุด)"
+    messages = build_staff_carousels(people, title)
+
+    # เพิ่มข้อความเปิดให้เห็นชัดว่าเป็นการแจ้งเตือนประจำวัน
+    intro = TextMessage(text=(
+        "⏰ แจ้งเตือนเวรประจำวัน เวลา 09.30 น.\n"
+        f"{title}"
+    ))
+    return [intro] + messages[1:]
+
+
+def send_daily_duty_notification(target: str) -> bool:
+    """ส่งเวรวันนี้ไปยัง User ID / Group ID / Room ID"""
+    if not target:
+        log.error('[daily-duty] DUTY_NOTIFY_TARGET is empty')
+        return False
+
+    try:
+        messages = build_daily_duty_messages()
+        _push(target, messages)
+        log.info(f'[daily-duty] sent to {target}')
+        return True
+    except Exception as exc:
+        log.error(f'[daily-duty] failed: {exc}', exc_info=True)
+        return False
 
 
 # ─── LINE reply / push ────────────────────────────────────────────────────────
@@ -732,10 +1415,9 @@ def _reply(reply_token: str, messages: list) -> bool:
             MessagingApi(api_client).reply_message(
                 ReplyMessageRequest(reply_token=reply_token, messages=messages[:5])
             )
-        log.info(f'[reply] ✅ sent {len(messages[:5])} message(s)')
         return True
     except Exception as e:
-        log.error(f'[reply] ❌ LINE API error: {e}', exc_info=True)
+        log.error(f'[reply] {e}')
         return False
 
 
@@ -747,101 +1429,153 @@ def _push(to: str, messages: list):
             MessagingApi(api_client).push_message(
                 PushMessageRequest(to=to, messages=messages[:5])
             )
-        log.info(f'[push] ✅ sent to {to}')
     except Exception as e:
-        log.error(f'[push] ❌ LINE API error: {e}', exc_info=True)
+        log.error(f'[push] {e}')
 
 
-def _safe_reply_text(reply_token: str, push_to: str, text: str):
-    """Fallback: ส่งแค่ TextMessage เดียว (ไม่มี Flex) เพื่อหลีกเลี่ยง Flex JSON error"""
-    msgs = [TextMessage(text=text)]
+# ─── LINE event handlers ──────────────────────────────────────────────────────
+# v6.6.1: ไม่ใช้ WebhookHandler.dispatch สำหรับ MessageEvent อีกต่อไป
+# เพราะบาง deployment ของ line-bot-sdk พบ log "No handler of MessageEvent" ทั้งที่ decorator ถูกต้อง
+# เราตรวจ X-Line-Signature เอง แล้ว route event จาก raw JSON โดยตรง
+
+
+def _verify_line_signature(body: str, signature: str) -> bool:
+    if not signature:
+        return False
+    digest = hmac.new(
+        LINE_CHANNEL_SECRET.encode('utf-8'),
+        body.encode('utf-8'),
+        hashlib.sha256,
+    ).digest()
+    expected = base64.b64encode(digest).decode('utf-8')
+    return hmac.compare_digest(expected, signature)
+
+
+def _source_target(source: dict) -> str:
+    return (
+        source.get('groupId')
+        or source.get('roomId')
+        or source.get('userId')
+        or ''
+    )
+
+
+def _handle_text_event(raw_event: dict):
+    source = raw_event.get('source') or {}
+    source_type = source.get('type', '')
+    push_to = _source_target(source)
+    reply_token = raw_event.get('replyToken', '')
+    message = raw_event.get('message') or {}
+    text = str(message.get('text') or '').strip()
+
+    log.info('[webhook:text] source=%s text=%r', source_type, text)
+    if not text:
+        return
+
+    # ในกลุ่ม/room ต้องขึ้นต้นด้วย bot เช่น "bot เวรวันนี้"
+    if source_type in ('group', 'room'):
+        if not re.match(r'^bot\b', text, re.IGNORECASE):
+            return
+        text = re.sub(r'^bot\s*', '', text, flags=re.IGNORECASE).strip()
+
+    # ดูรหัสแชตเพื่อใช้ตั้งค่า DUTY_NOTIFY_TARGET
+    if re.match(r'^(รหัสแชต|chat\s*id|group\s*id|ไอดีแชต)$', text, re.IGNORECASE):
+        label = 'Group ID' if source_type == 'group' else (
+            'Room ID' if source_type == 'room' else 'User ID'
+        )
+        msgs = [TextMessage(text=(
+            f"🆔 {label}\n{push_to}\n\n"
+            "นำค่านี้ไปใส่ Environment Variable ชื่อ DUTY_NOTIFY_TARGET"
+        ))]
+    elif re.match(r'^(ทดสอบแจ้งเวร|ทดสอบเวรอัตโนมัติ)$', text):
+        msgs = build_daily_duty_messages()
+    else:
+        try:
+            msgs = handle_message(text)
+        except Exception as exc:
+            log.error('[webhook:text] handle_message failed: %s', exc, exc_info=True)
+            msgs = [TextMessage(text=(
+                "❌ ระบบประมวลผลข้อความผิดพลาด\n"
+                "กรุณาลองใหม่อีกครั้ง หรือแจ้งผู้ดูแลตรวจสอบ Render log"
+            ))]
+
     if not _reply(reply_token, msgs) and push_to:
         _push(push_to, msgs)
 
 
-# ─── LINE event handlers ──────────────────────────────────────────────────────
-@handler.add(MessageEvent, message=TextMessageContent)
-def on_message(event):
-    source      = event.source
-    source_type = source.type
-    push_to     = (getattr(source,'group_id',None) or
-                   getattr(source,'room_id',None)  or
-                   getattr(source,'user_id',None))
-    text = event.message.text.strip()
+def _handle_raw_event(raw_event: dict):
+    event_type = raw_event.get('type', '')
 
-    if source_type in ('group','room'):
-        if not re.match(r'^bot\b', text, re.IGNORECASE):
-            return
-        text = re.sub(r'^bot\s*','', text, flags=re.IGNORECASE).strip()
+    if event_type == 'message':
+        message = raw_event.get('message') or {}
+        if message.get('type') == 'text':
+            _handle_text_event(raw_event)
+        else:
+            log.info('[webhook] unsupported message type=%s', message.get('type'))
+        return
 
-    # ── สร้าง reply messages (ถ้า error → fallback text ทันที ไม่เงียบ) ──
-    try:
-        msgs = handle_message(text)
-    except Exception as e:
-        log.error(f'[on_message] handle_message error: {e}', exc_info=True)
-        msgs = [TextMessage(text='❌ เกิดข้อผิดพลาดภายใน\nกรุณาลองใหม่ หรือแจ้ง admin ตรวจสอบ log')]
-
-    # ── ส่ง reply (ถ้า Flex ส่งไม่ได้ → fallback เป็น text เดิม) ──
-    try:
-        sent = _reply(event.reply_token, msgs)
-    except Exception as e:
-        log.error(f'[on_message] _reply threw: {e}', exc_info=True)
-        sent = False
-
-    if not sent and push_to:
-        try:
-            _push(push_to, msgs)
-        except Exception as e:
-            log.error(f'[on_message] _push threw: {e}', exc_info=True)
-
-
-@handler.add(JoinEvent)
-def on_join(event):
-    source = event.source
-    msgs   = [TextMessage(text=WELCOME_TEXT)]
-    if not _reply(event.reply_token, msgs):
-        target = getattr(source,'group_id',None) or getattr(source,'room_id',None)
-        if target:
+    if event_type in ('join', 'follow'):
+        source = raw_event.get('source') or {}
+        target = _source_target(source)
+        reply_token = raw_event.get('replyToken', '')
+        msgs = [TextMessage(text=WELCOME_TEXT)]
+        if not _reply(reply_token, msgs) and target:
             _push(target, msgs)
+        return
 
-
-@handler.add(FollowEvent)
-def on_follow(event):
-    source = event.source
-    msgs   = [TextMessage(text=WELCOME_TEXT)]
-    if not _reply(event.reply_token, msgs):
-        uid = getattr(source,'user_id',None)
-        if uid:
-            _push(uid, msgs)
-
-
-@handler.add(MemberJoinedEvent)
-def on_member_join(_event):
-    pass
-
-
-@handler.add(LeaveEvent)
-def on_leave(_event):
-    log.info('[leave] Bot removed from chat')
-
-
-@handler.add(UnfollowEvent)
-def on_unfollow(_event):
-    log.info('[unfollow] User blocked bot')
+    if event_type == 'leave':
+        log.info('[leave] Bot removed from chat')
+    elif event_type == 'unfollow':
+        log.info('[unfollow] User blocked bot')
+    else:
+        log.info('[webhook] ignored event type=%s', event_type)
 
 
 # ─── Flask routes ─────────────────────────────────────────────────────────────
 @app.route('/callback', methods=['POST'])
 def callback():
-    sig  = request.headers.get('X-Line-Signature','')
+    # เริ่ม preload แบบ background ใน worker process
+    if not _staff_data:
+        _start_staff_fetch()
+    if not _arrest_data:
+        _start_arrest_fetch()
+
+    signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
-    try:
-        handler.handle(body, sig)
-    except InvalidSignatureError:
+
+    if not _verify_line_signature(body, signature):
+        log.warning('[webhook] invalid LINE signature')
         abort(400)
-    except Exception as e:
-        log.error(f'[webhook] {e}', exc_info=True)
+
+    try:
+        payload = json.loads(body or '{}')
+        events = payload.get('events') or []
+        log.info('[webhook] received %d event(s)', len(events))
+        for raw_event in events:
+            _handle_raw_event(raw_event)
+    except Exception as exc:
+        # ตอบ 200 เพื่อไม่ให้ LINE retry ซ้ำ แต่บันทึก stack trace ไว้ครบ
+        log.error('[webhook] processing error: %s', exc, exc_info=True)
+
     return 'OK', 200
+
+
+@app.route('/scheduled-duty', methods=['GET', 'POST'])
+def scheduled_duty():
+    expected = os.environ.get('CRON_SECRET', '')
+    supplied = (
+        request.headers.get('X-Cron-Secret', '')
+        or request.args.get('key', '')
+    )
+    if not expected or supplied != expected:
+        abort(403)
+
+    target = os.environ.get('DUTY_NOTIFY_TARGET', '').strip()
+    if not target:
+        return 'DUTY_NOTIFY_TARGET is not set', 500
+
+    ok = send_daily_duty_notification(target)
+    return ('sent', 200) if ok else ('failed', 500)
 
 
 @app.route('/ping')
@@ -851,61 +1585,49 @@ def ping():
 
 @app.route('/refresh')
 def http_refresh():
-    threading.Thread(target=_do_fetch, daemon=True).start()
-    return 'refreshing...', 200
+    _start_staff_fetch()
+    _start_arrest_fetch()
+    return 'refreshing staff and arrests separately...', 200
 
 
 @app.route('/')
 def index():
-    n    = len(_cache_data)
-    age  = int(time.time() - _cache_ts) if _cache_ts else -1
-    stale = ' (stale — refreshing)' if cache_is_stale() else ''
-    return f'LINE Bot สน.บางชัน v4.1 | {n} records | cache age {age}s{stale}', 200
+    if not _staff_data:
+        _start_staff_fetch()
+    if not _arrest_data:
+        _start_arrest_fetch()
+    with _arrest_lock:
+        arrest_n = len(_arrest_data)
+        arrest_age = int(time.time() - _arrest_ts) if _arrest_ts else -1
+    with _staff_lock:
+        staff_n = len(_staff_data)
+        staff_age = int(time.time() - _staff_ts) if _staff_ts else -1
+    return (
+        f'LINE Bot สน.บางชัน v6.6.1 | arrests {arrest_n} age {arrest_age}s | '
+        f'staff {staff_n} age {staff_age}s'
+    ), 200
 
 
 @app.route('/debug')
 def debug():
-    """ทดสอบการเชื่อมต่อ Apps Script และแสดง raw response"""
-    try:
-        params = {'key': APPS_SCRIPT_KEY} if APPS_SCRIPT_KEY else {}
-        resp   = requests.get(
-            APPS_SCRIPT_URL, params=params,
-            timeout=FETCH_TIMEOUT, allow_redirects=True
-        )
-        ct      = resp.headers.get('Content-Type', '')
-        preview = resp.text[:500]
+    lines = ['=== LINE Bot v6 Debug ===']
+    for mode, timeout in [('staff', STAFF_FETCH_TIMEOUT), ('arrests', ARREST_FETCH_TIMEOUT)]:
         try:
-            payload  = resp.json()
-            n_rec    = len(payload.get('records', []))
-            sheets   = payload.get('sheetsProcessed', '?')
-            err_msg  = payload.get('error', None)
-            status   = f'OK — {n_rec} records, {sheets} sheets'
-            if err_msg:
-                status = f'ERROR: {err_msg}'
-        except Exception:
-            n_rec  = 0
-            status = 'JSON parse failed'
-
-        lines = [
-            '=== Debug: Apps Script ===',
-            f'URL: {resp.url[:100]}',
-            f'HTTP: {resp.status_code}',
-            f'Content-Type: {ct}',
-            f'Apps Script status: {status}',
-            f'Cache: {len(_cache_data)} records, age {int(time.time()-_cache_ts) if _cache_ts else -1}s',
-            f'Fetching: {_fetching}',
-            '',
-            '--- Response preview (first 500 chars) ---',
-            preview,
-        ]
-        return '\n'.join(lines), 200, {'Content-Type': 'text/plain; charset=utf-8'}
-    except Exception as e:
-        return f'debug error: {e}', 500
+            payload = _request_api(mode, timeout)
+            count = len(payload.get('staff', [])) if mode == 'staff' else len(payload.get('records', []))
+            lines.append(f'{mode}: OK — {count} records')
+        except Exception as e:
+            lines.append(f'{mode}: ERROR — {e}')
+    with _arrest_lock:
+        lines.append(f'arrest cache: {len(_arrest_data)}')
+    with _staff_lock:
+        lines.append(f'staff cache: {len(_staff_data)}')
+    return '\n'.join(lines), 200, {'Content-Type': 'text/plain; charset=utf-8'}
 
 
 # ─── Startup preload ──────────────────────────────────────────────────────────
-# ทำงานตอน gunicorn import module — ไม่ใช้ if __name__ เพราะ gunicorn ไม่รัน block นั้น
-threading.Thread(target=_do_fetch, daemon=True).start()
+# ไม่เริ่ม thread ตอน import เพราะ Gunicorn อาจ import ใน master ก่อน fork worker
+# การ preload จะเริ่มจาก route / หรือ /callback ซึ่งทำงานใน worker processจริง
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
