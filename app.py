@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 LINE Bot — ระบบสืบค้นผลการจับกุม สน.บางชัน
-v6.8.4 — แก้ปุ่มไฟล์บันทึกจับกุม + webhook direct handler
+v6.6.1 — แก้ webhook ไม่ตอบ: bypass SDK dispatcher + รองรับเวรวันนี้
 ดึงข้อมูลจาก Google Apps Script Web App → cache ใน RAM → ตอบ Flex Message
 """
 
@@ -108,7 +108,6 @@ def _normalise(r: dict) -> dict:
         'location': r.get('location', ''),
         'note': r.get('note', ''),
         'image_url': r.get('imageUrl'),
-        'record_file_url': str(r.get('recordFileUrl', '') or '').strip(),
     }
 
 
@@ -493,10 +492,9 @@ def build_bubble(rec: dict) -> dict:
     date       = rec.get('date','-')
     location   = rec.get('location','') or '-'
     evidence   = rec.get('evidence','') or '-'
-    age             = rec.get('age','') or '-'
-    image_url       = rec.get('image_url')
-    record_file_url = str(rec.get('record_file_url','') or '').strip()
-    month_abbr      = rec.get('month_abbr','')
+    age        = rec.get('age','') or '-'
+    image_url  = rec.get('image_url')
+    month_abbr = rec.get('month_abbr','')
     year_be    = rec.get('year_be','')
     period     = f"{month_abbr} {year_be}".strip() or rec.get('sheet','')
 
@@ -537,20 +535,6 @@ def build_bubble(rec: dict) -> dict:
         bubble['hero'] = {
             'type':'image','url':image_url,
             'size':'full','aspectRatio':'4:3','aspectMode':'cover',
-        }
-
-    # ก.ค.69 เป็นต้นไป: ถ้ามีลิงก์ไฟล์บันทึกจับกุม ให้แสดงปุ่มใต้การ์ด
-    if record_file_url and re.match(r'^https?://', record_file_url, re.IGNORECASE):
-        bubble['footer'] = {
-            'type':'box','layout':'vertical','spacing':'sm','paddingAll':'10px',
-            'contents':[{
-                'type':'button','style':'primary','height':'sm','color':color,
-                'action':{
-                    'type':'uri',
-                    'label':'📄 เปิดไฟล์บันทึกจับกุม',
-                    'uri':record_file_url[:1000],
-                }
-            }]
         }
     return bubble
 
@@ -1636,10 +1620,6 @@ def debug():
             lines.append(f'{mode}: ERROR — {e}')
     with _arrest_lock:
         lines.append(f'arrest cache: {len(_arrest_data)}')
-        file_rows = [r for r in _arrest_data if r.get('record_file_url')]
-        lines.append(f'arrest records with file: {len(file_rows)}')
-        for r in file_rows[:3]:
-            lines.append(f"file sample: {r.get('name','-')} -> {r.get('record_file_url','')[:120]}")
     with _staff_lock:
         lines.append(f'staff cache: {len(_staff_data)}')
     return '\n'.join(lines), 200, {'Content-Type': 'text/plain; charset=utf-8'}
