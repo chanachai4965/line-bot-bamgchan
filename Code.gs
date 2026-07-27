@@ -135,31 +135,38 @@ function parseSheet(ws, sheetName) {
     // ข้ามแถวที่ทุกเซลล์ว่าง
     if (row.every(v => v === null || v === undefined || v === '')) continue;
 
-    let imageUrl = null;
+    let imageUrl      = null;
+    let recordFileUrl = null;
     if (isNew) {
       const imgVal  = g('image');
-      const fileUrl = g('file');
-      imageUrl = driveToImage(imgVal) || driveToImage(fileUrl)
+      const fileVal = g('file');
+      // รูปผู้ต้องหา: จากคอลัมน์ image เท่านั้น
+      imageUrl = driveToImage(imgVal)
               || (imgVal.startsWith('http') ? imgVal : null);
+      // ไฟล์บันทึกจับกุม: คอลัมน์ file → เก็บ URL เดิมไว้เลย (เปิดใน Browser ได้)
+      if (fileVal && fileVal.startsWith('http')) {
+        recordFileUrl = fileVal;
+      }
     }
 
     records.push({
-      sheet:     sheetName,
-      yearBe:    yearBe,
-      monthNum:  monthNum,
-      monthAbbr: monthAbbr,
-      seq:       seq,
-      date:      g('date'),
-      group:     isNew ? g('group')    : '',
-      charge:    g('charge'),
-      name:      name,
-      nickname:  isNew ? g('nickname') : '',
-      age:       g('age'),
-      pid:       g('pid'),
-      evidence:  g('evidence'),
-      location:  g('location'),
-      note:      isNew ? g('note')     : '',
-      imageUrl:  imageUrl
+      sheet:         sheetName,
+      yearBe:        yearBe,
+      monthNum:      monthNum,
+      monthAbbr:     monthAbbr,
+      seq:           seq,
+      date:          g('date'),
+      group:         isNew ? g('group')    : '',
+      charge:        g('charge'),
+      name:          name,
+      nickname:      isNew ? g('nickname') : '',
+      age:           g('age'),
+      pid:           g('pid'),
+      evidence:      g('evidence'),
+      location:      g('location'),
+      note:          isNew ? g('note')     : '',
+      imageUrl:      imageUrl,
+      recordFileUrl: recordFileUrl        // ← ไฟล์บันทึกจับกุม (ก.ค.69+)
     });
   }
 
