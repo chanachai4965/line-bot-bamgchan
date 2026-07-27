@@ -1,5 +1,5 @@
 /**
- * LINE Bot สน.บางชัน — Google Apps Script Data API v6.8.3
+ * LINE Bot สน.บางชัน — Google Apps Script Data API v6.8.4
  * วิธีใช้: Deploy → New Deployment → Web App
  *          Execute as: Me, Who has access: Anyone
  *
@@ -51,7 +51,7 @@ function doGet(e) {
       return json(getArrestRecords());
     }
     if (mode === 'ping') {
-      return json({ ok: true, version: '6.8.3' });
+      return json({ ok: true, version: '6.0' });
     }
     return json({ error: 'Unknown mode', allowed: ['staff', 'arrests', 'ping'] });
   } catch (err) {
@@ -203,25 +203,23 @@ function parseSheet(ws, sheetName) {
       const fileIdx  = COL.file;
 
       const rawImgValue = imageIdx !== undefined ? row[imageIdx] : null;
-
       const imgVal      = g('image');
-      const fileVal     = g('file');
       const imgFormula  = imageIdx !== undefined ? (formulas[i][imageIdx] || '') : '';
-      const fileFormula = fileIdx  !== undefined ? (formulas[i][fileIdx]  || '') : '';
       const imgLink     = imageIdx !== undefined ? richTextLink(richTexts[i][imageIdx]) : '';
-      const fileLink    = fileIdx  !== undefined ? richTextLink(richTexts[i][fileIdx])  : '';
 
-      // คอลัมน์ J = รูปภาพผู้ต้องหาเท่านั้น
+      // รูปผู้ต้องหา: อ่านเฉพาะคอลัมน์รูปภาพเท่านั้น
       imageUrl = cellImageUrl(rawImgValue)
               || normaliseImageUrl(imgVal)
               || normaliseImageUrl(imgLink)
               || imageUrlFromFormula(imgFormula);
 
-      // คอลัมน์ M = ไฟล์บันทึกจับกุม
-      recordFileUrl = normaliseFileUrl(fileVal)
-                   || normaliseFileUrl(fileLink)
-                   || fileUrlFromFormula(fileFormula)
-                   || '';
+      // ไฟล์บันทึกจับกุม: อ่านจากคอลัมน์ M (file:12) แยกจากรูปภาพโดยเด็ดขาด
+      if (fileIdx !== undefined && fileIdx >= 0 && fileIdx < row.length) {
+        const fileVal     = g('file');
+        const fileFormula = formulas[i][fileIdx] || '';
+        const fileLink    = richTextLink(richTexts[i][fileIdx]) || '';
+        recordFileUrl = extractFileUrl(fileVal, fileLink, fileFormula);
+      }
     }
 
     records.push({
@@ -239,8 +237,8 @@ function parseSheet(ws, sheetName) {
       pid:       g('pid'),
       evidence:  g('evidence'),
       location:  g('location'),
-      note:          isNew ? g('note') : '',
-      imageUrl:      imageUrl,
+      note:      isNew ? g('note')     : '',
+      imageUrl:  imageUrl,
       recordFileUrl: recordFileUrl
     });
   }
@@ -447,26 +445,30 @@ function richTextLink(richText) {
   return '';
 }
 
+function extractFileUrl(cellText, richLink, formula) {
+  // 1) ลิงก์จาก RichText/Hyperlink ของเซลล์
+  if (richLink && /^https?:\/\//i.test(String(richLink).trim())) {
+    return String(richLink).trim();
+  }
+
+  // 2) ค่า URL ที่พิมพ์ตรงในเซลล์
+  const text = String(cellText || '').trim();
+  if (/^https?:\/\//i.test(text)) return text;
+
+  // 3) สูตร =HYPERLINK("url","ข้อความ")
+  const f = String(formula || '');
+  const m = f.match(/=HYPERLINK\s*\(\s*"([^"]+)"/i);
+  if (m && /^https?:\/\//i.test(m[1])) return m[1].trim();
+
+  return '';
+}
+
 function imageUrlFromFormula(formula) {
   if (!formula) return null;
 
   // รองรับ =IMAGE("url") และ =HYPERLINK("url","ข้อความ")
   const m = formula.match(/=(?:IMAGE|HYPERLINK)\s*\(\s*"([^"]+)"/i);
   return m ? normaliseImageUrl(m[1]) : null;
-}
-
-
-function fileUrlFromFormula(formula) {
-  if (!formula) return '';
-  const m = String(formula).match(/=HYPERLINK\s*\(\s*"([^"]+)"/i);
-  return m ? normaliseFileUrl(m[1]) : '';
-}
-
-function normaliseFileUrl(url) {
-  if (!url) return '';
-  url = String(url).trim();
-  if (!url) return '';
-  return /^https?:\/\//i.test(url) ? url : '';
 }
 
 function normaliseImageUrl(url) {
