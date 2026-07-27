@@ -108,6 +108,9 @@ def _normalise(r: dict) -> dict:
         'location': r.get('location', ''),
         'note': r.get('note', ''),
         'image_url': r.get('imageUrl'),
+        # รองรับหลายชื่อ field เพื่อให้เข้ากันได้กับ API หลายเวอร์ชัน
+        'record_file_url': (r.get('recordFileUrl') or r.get('record_file_url')
+                            or r.get('fileUrl') or r.get('file_url') or ''),
     }
 
 
@@ -493,8 +496,9 @@ def build_bubble(rec: dict) -> dict:
     location   = rec.get('location','') or '-'
     evidence   = rec.get('evidence','') or '-'
     age        = rec.get('age','') or '-'
-    image_url  = rec.get('image_url')
-    month_abbr = rec.get('month_abbr','')
+    image_url       = rec.get('image_url')
+    record_file_url = (rec.get('record_file_url') or '').strip()
+    month_abbr      = rec.get('month_abbr','')
     year_be    = rec.get('year_be','')
     period     = f"{month_abbr} {year_be}".strip() or rec.get('sheet','')
 
@@ -535,6 +539,26 @@ def build_bubble(rec: dict) -> dict:
         bubble['hero'] = {
             'type':'image','url':image_url,
             'size':'full','aspectRatio':'4:3','aspectMode':'cover',
+        }
+
+    # ตั้งแต่ ก.ค. 2569 เป็นต้นไป ถ้ามีลิงก์ไฟล์บันทึกจับกุมให้แสดงปุ่มใต้การ์ด
+    if record_file_url and record_file_url.startswith(('http://', 'https://')):
+        bubble['footer'] = {
+            'type': 'box',
+            'layout': 'vertical',
+            'spacing': 'sm',
+            'paddingAll': '10px',
+            'contents': [{
+                'type': 'button',
+                'style': 'primary',
+                'height': 'sm',
+                'color': color,
+                'action': {
+                    'type': 'uri',
+                    'label': '📄 เปิดไฟล์บันทึกจับกุม',
+                    'uri': record_file_url,
+                },
+            }],
         }
     return bubble
 
@@ -1603,23 +1627,33 @@ def index():
         staff_n = len(_staff_data)
         staff_age = int(time.time() - _staff_ts) if _staff_ts else -1
     return (
-        f'LINE Bot สน.บางชัน v6.6.1 | arrests {arrest_n} age {arrest_age}s | '
+        f'LINE Bot สน.บางชัน v6.8.6 | arrests {arrest_n} age {arrest_age}s | '
         f'staff {staff_n} age {staff_age}s'
     ), 200
 
 
 @app.route('/debug')
 def debug():
-    lines = ['=== LINE Bot v6 Debug ===']
+    lines = ['=== LINE Bot v6.8.6 Debug ===']
+    # แสดงเฉพาะ host/path ของแหล่งข้อมูล ไม่แสดง secret key
+    lines.append(f'APPS_SCRIPT_URL set: {bool(APPS_SCRIPT_URL)}')
     for mode, timeout in [('staff', STAFF_FETCH_TIMEOUT), ('arrests', ARREST_FETCH_TIMEOUT)]:
         try:
             payload = _request_api(mode, timeout)
-            count = len(payload.get('staff', [])) if mode == 'staff' else len(payload.get('records', []))
+            raw_rows = payload.get('staff', []) if mode == 'staff' else payload.get('records', [])
+            count = len(raw_rows)
             lines.append(f'{mode}: OK — {count} records')
+            if mode == 'arrests':
+                with_file = [r for r in raw_rows if (r.get('recordFileUrl') or r.get('record_file_url') or r.get('fileUrl') or r.get('file_url'))]
+                lines.append(f'arrests with recordFileUrl: {len(with_file)}')
+                for r in with_file[:3]:
+                    lines.append(f"  sample: {r.get('name','-')} | {r.get('date','-')} | file=YES")
         except Exception as e:
             lines.append(f'{mode}: ERROR — {e}')
     with _arrest_lock:
+        cache_with_file = sum(1 for r in _arrest_data if r.get('record_file_url'))
         lines.append(f'arrest cache: {len(_arrest_data)}')
+        lines.append(f'arrest cache with file: {cache_with_file}')
     with _staff_lock:
         lines.append(f'staff cache: {len(_staff_data)}')
     return '\n'.join(lines), 200, {'Content-Type': 'text/plain; charset=utf-8'}
