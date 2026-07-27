@@ -177,11 +177,12 @@ def cache_is_stale() -> bool:
 
 
 # ─── Text normalisation ───────────────────────────────────────────────────────
-def normalise_text(s: str) -> str:
-    """ตัดช่องว่างซ้ำ normalize ข้อความ (ไทย/อังกฤษ)"""
-    if not s:
+def normalise_text(s) -> str:
+    """ตัดช่องว่างซ้ำ normalize ข้อความ — รองรับ str/int/float/None"""
+    if s is None:
         return ''
-    return re.sub(r'\s+', ' ', s.strip())
+    s = str(s).strip()
+    return re.sub(r'\s+', ' ', s)
 
 
 # ─── Thai month helpers ───────────────────────────────────────────────────────
@@ -414,9 +415,17 @@ def build_bubble(rec: dict) -> dict:
 
 
 def build_carousel(records: list, alt: str) -> FlexMessage:
-    bubbles   = [build_bubble(r) for r in records[:10]]
-    container = {'type':'carousel','contents':bubbles} if len(bubbles) > 1 else bubbles[0]
-    return FlexMessage(alt_text=alt, contents=FlexContainer.from_dict(container))
+    try:
+        bubbles   = [build_bubble(r) for r in records[:10]]
+        container = {'type':'carousel','contents':bubbles} if len(bubbles) > 1 else bubbles[0]
+        return FlexMessage(alt_text=alt[:400], contents=FlexContainer.from_dict(container))
+    except Exception as e:
+        log.error(f'[build_carousel] Flex error: {e}', exc_info=True)
+        # Fallback: plain text list
+        lines = []
+        for i, r in enumerate(records[:10], 1):
+            lines.append(f"{i}. {r.get('name','-')} — {(r.get('charge','') or '')[:20]}")
+        return TextMessage(text='\n'.join(lines))
 
 
 def build_name_results(kw: str, rows: list, total: int) -> list:
@@ -525,8 +534,15 @@ def build_summary_flex(title: str, total: int, cat: dict, records: list) -> Flex
             ]
         }
     }
-    return FlexMessage(alt_text=f'{title}: {total} ราย',
-                       contents=FlexContainer.from_dict(bubble))
+    try:
+        return FlexMessage(alt_text=f'{title}: {total} ราย',
+                           contents=FlexContainer.from_dict(bubble))
+    except Exception as e:
+        log.error(f'[build_summary_flex] Flex error: {e}', exc_info=True)
+        lines = [f'🚔 {title} — {total} ราย']
+        for i, r in enumerate(records[:10], 1):
+            lines.append(f"{i}. {r.get('name','-')}")
+        return TextMessage(text='\n'.join(lines))
 
 
 # ─── Command router ───────────────────────────────────────────────────────────
@@ -716,9 +732,10 @@ def _reply(reply_token: str, messages: list) -> bool:
             MessagingApi(api_client).reply_message(
                 ReplyMessageRequest(reply_token=reply_token, messages=messages[:5])
             )
+        log.info(f'[reply] ✅ sent {len(messages[:5])} message(s)')
         return True
     except Exception as e:
-        log.error(f'[reply] {e}')
+        log.error(f'[reply] ❌ LINE API error: {e}', exc_info=True)
         return False
 
 
@@ -730,8 +747,16 @@ def _push(to: str, messages: list):
             MessagingApi(api_client).push_message(
                 PushMessageRequest(to=to, messages=messages[:5])
             )
+        log.info(f'[push] ✅ sent to {to}')
     except Exception as e:
-        log.error(f'[push] {e}')
+        log.error(f'[push] ❌ LINE API error: {e}', exc_info=True)
+
+
+def _safe_reply_text(reply_token: str, push_to: str, text: str):
+    """Fallback: ส่งแค่ TextMessage เดียว (ไม่มี Flex) เพื่อหลีกเลี่ยง Flex JSON error"""
+    msgs = [TextMessage(text=text)]
+    if not _reply(reply_token, msgs) and push_to:
+        _push(push_to, msgs)
 
 
 # ─── LINE event handlers ──────────────────────────────────────────────────────
@@ -749,9 +774,25 @@ def on_message(event):
             return
         text = re.sub(r'^bot\s*','', text, flags=re.IGNORECASE).strip()
 
-    msgs = handle_message(text)
-    if not _reply(event.reply_token, msgs) and push_to:
-        _push(push_to, msgs)
+    # ── สร้าง reply messages (ถ้า error → fallback text ทันที ไม่เงียบ) ──
+    try:
+        msgs = handle_message(text)
+    except Exception as e:
+        log.error(f'[on_message] handle_message error: {e}', exc_info=True)
+        msgs = [TextMessage(text='❌ เกิดข้อผิดพลาดภายใน\nกรุณาลองใหม่ หรือแจ้ง admin ตรวจสอบ log')]
+
+    # ── ส่ง reply (ถ้า Flex ส่งไม่ได้ → fallback เป็น text เดิม) ──
+    try:
+        sent = _reply(event.reply_token, msgs)
+    except Exception as e:
+        log.error(f'[on_message] _reply threw: {e}', exc_info=True)
+        sent = False
+
+    if not sent and push_to:
+        try:
+            _push(push_to, msgs)
+        except Exception as e:
+            log.error(f'[on_message] _push threw: {e}', exc_info=True)
 
 
 @handler.add(JoinEvent)
