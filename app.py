@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 LINE Bot — ระบบสืบค้นผลการจับกุม สน.บางชัน
-v6.6.1 — แก้ webhook ไม่ตอบ: bypass SDK dispatcher + รองรับเวรวันนี้
+v6.8.7 — แก้ cron แจ้งเวร 09.00/09.30 และคงฟีเจอร์เดิมทั้งหมด
 ดึงข้อมูลจาก Google Apps Script Web App → cache ใน RAM → ตอบ Flex Message
 """
 
@@ -1414,19 +1414,54 @@ def build_daily_duty_messages(target_date: Optional[date] = None) -> list:
     return [intro] + messages[1:]
 
 
-def send_daily_duty_notification(target: str) -> bool:
-    """ส่งเวรวันนี้ไปยัง User ID / Group ID / Room ID"""
+def build_daily_duty_prealert_messages(target_date: Optional[date] = None) -> list:
+    """สร้างข้อความเตือนล่วงหน้าเวลา 09.00 น. ก่อนแจ้งรายชื่อเต็มเวลา 09.30 น."""
+    duty_date = target_date or datetime.now(BANGKOK_TZ).date()
+    team = 1 if duty_date.day % 2 == 0 else 2
+    title = duty_title(duty_date, team) + " (ไม่รวมผู้ควบคุมชุด)"
+    return [TextMessage(text=(
+        "⏰ แจ้งเตือนล่วงหน้า เวลา 09.00 น.\n"
+        "อีก 30 นาที ระบบจะแจ้งรายชื่อผู้เข้าเวรประจำวัน\n"
+        f"{title}"
+    ))]
+
+
+def _duty_notify_target(target: Optional[str] = None) -> str:
+    """รองรับทั้งการส่ง target เข้ามาเองและการเรียกตรงจาก Render Cron Job."""
+    return str(target or os.environ.get('DUTY_NOTIFY_TARGET', '')).strip()
+
+
+def send_daily_duty_prealert(target: Optional[str] = None) -> bool:
+    """ส่งข้อความเตือนล่วงหน้า 09.00 น. ไปยัง User/Group/Room ที่ตั้งค่าไว้."""
+    target = _duty_notify_target(target)
     if not target:
-        log.error('[daily-duty] DUTY_NOTIFY_TARGET is empty')
+        log.error('[daily-duty:0900] DUTY_NOTIFY_TARGET is empty')
         return False
 
     try:
-        messages = build_daily_duty_messages()
-        _push(target, messages)
-        log.info(f'[daily-duty] sent to {target}')
-        return True
+        ok = _push(target, build_daily_duty_prealert_messages())
+        if ok:
+            log.info('[daily-duty:0900] sent to %s', target)
+        return ok
     except Exception as exc:
-        log.error(f'[daily-duty] failed: {exc}', exc_info=True)
+        log.error('[daily-duty:0900] failed: %s', exc, exc_info=True)
+        return False
+
+
+def send_daily_duty_notification(target: Optional[str] = None) -> bool:
+    """ส่งรายชื่อเวร 09.30 น.; cron เรียกโดยไม่ส่ง argument ได้."""
+    target = _duty_notify_target(target)
+    if not target:
+        log.error('[daily-duty:0930] DUTY_NOTIFY_TARGET is empty')
+        return False
+
+    try:
+        ok = _push(target, build_daily_duty_messages())
+        if ok:
+            log.info('[daily-duty:0930] sent to %s', target)
+        return ok
+    except Exception as exc:
+        log.error('[daily-duty:0930] failed: %s', exc, exc_info=True)
         return False
 
 
@@ -1445,16 +1480,19 @@ def _reply(reply_token: str, messages: list) -> bool:
         return False
 
 
-def _push(to: str, messages: list):
+def _push(to: str, messages: list) -> bool:
     if not to:
-        return
+        log.error('[push] target is empty')
+        return False
     try:
         with ApiClient(configuration) as api_client:
             MessagingApi(api_client).push_message(
                 PushMessageRequest(to=to, messages=messages[:5])
             )
+        return True
     except Exception as e:
-        log.error(f'[push] {e}')
+        log.error(f'[push] {e}', exc_info=True)
+        return False
 
 
 # ─── LINE event handlers ──────────────────────────────────────────────────────
