@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 LINE Bot — ระบบสืบค้นผลการจับกุม สน.บางชัน
-v6.8.7 — แก้ cron แจ้งเวร 09.00/09.30 และคงฟีเจอร์เดิมทั้งหมด
+v6.8.8 — ปรับตารางเวรสลับชุดวันละ 1 วัน โดย 4 ส.ค. 2569 = ชป.2
 ดึงข้อมูลจาก Google Apps Script Web App → cache ใน RAM → ตอบ Flex Message
 """
 
@@ -645,6 +645,20 @@ def build_summary_flex(title: str, total: int, cat: dict, records: list) -> Flex
 # ─── Staff / operation team helpers ───────────────────────────────────────────
 BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
 
+# ตารางเวรแบบสลับชุดวันละ 1 วัน
+# จุดอ้างอิงที่ยืนยัน: 4 สิงหาคม 2569 (2026-08-04) = ชป.2
+DUTY_ROTATION_ANCHOR_DATE = date(2026, 8, 4)
+DUTY_ROTATION_ANCHOR_TEAM = 2
+
+
+def duty_team_for_date(duty_date: date) -> int:
+    """คืนหมายเลขชุดเข้าเวร โดยสลับ ชป.1/ชป.2 วันละหนึ่งวัน"""
+    days_from_anchor = (duty_date - DUTY_ROTATION_ANCHOR_DATE).days
+    if days_from_anchor % 2 == 0:
+        return DUTY_ROTATION_ANCHOR_TEAM
+    return 1 if DUTY_ROTATION_ANCHOR_TEAM == 2 else 2
+
+
 
 def _search_key(value: str) -> str:
     """ทำข้อความให้เหมาะกับการค้นหา: ตัดช่องว่าง จุด และขีด"""
@@ -841,11 +855,10 @@ def parse_duty_date(text: str) -> Optional[date]:
 def duty_title(duty_date: date, team: int) -> str:
     be_year = duty_date.year + 543
     weekday = THAI_WEEKDAY[duty_date.weekday()]
-    parity = 'วันคู่' if duty_date.day % 2 == 0 else 'วันคี่'
     return (
         f"เวร{weekday}ที่ {duty_date.day} "
         f"{THAI_MONTH_FULL[duty_date.month]} {be_year} "
-        f"({parity}) — ชุดปฏิบัติการที่ {team}"
+        f"— ชุดปฏิบัติการที่ {team}"
     )
 
 
@@ -868,7 +881,7 @@ def build_staff_bubble(person: dict) -> dict:
     if is_controller:
         duty_text = 'ผู้ควบคุมชุด — ไม่เข้าเวร'
     else:
-        duty_text = 'เข้าเวรวันคู่' if team == 1 else 'เข้าเวรวันคี่' if team == 2 else '-'
+        duty_text = 'หมุนเวียนเข้าเวรวันละ 1 ชุด' if team in (1, 2) else '-'
     color = '#1565C0' if team == 1 else '#7B1FA2' if team == 2 else '#37474F'
 
     name = person.get('name', '-') or '-'
@@ -1134,7 +1147,8 @@ HELP_TEXT = (
     "🗓️ ค้นหาเวรได้หลายรูปแบบ\n"
     "   เวรวันนี้, ใครเข้าเวรพรุ่งนี้\n"
     "   เวร 20 ก.ค.69, เข้าเวร 20/7/69\n"
-    "   วันคู่ = ชุด 1, วันคี่ = ชุด 2\n\n"
+    "   ตารางเวรสลับ ชป.1 / ชป.2 วันละ 1 วัน\n"\
+    "   จุดอ้างอิง 4 ส.ค. 2569 = ชป.2\n\n"
     "🔍 ค้นหา <ชื่อผู้ต้องหา>\n"
     "📍 สถานที่ <สถานที่จับกุม>\n"
     "📅 เดือน ก.ค. 69\n"
@@ -1223,10 +1237,10 @@ def handle_message(text: str) -> list:
             people, f"ชุดปฏิบัติการที่ {team}"
         )
 
-    # ── เวรวันคู่/วันคี่: ค้นจากฐานบุคลากรก่อนเสมอ ──
+    # ── เวรสลับชุดวันละ 1 วัน: ค้นจากฐานบุคลากรก่อนเสมอ ──
     duty_date = parse_duty_date(t)
     if duty_date:
-        team = 1 if duty_date.day % 2 == 0 else 2
+        team = duty_team_for_date(duty_date)
         people = duty_staff_by_team(team, staff)
         title = duty_title(duty_date, team) + " (ไม่รวมผู้ควบคุมชุด)"
         return build_staff_carousels(
@@ -1400,7 +1414,7 @@ def build_daily_duty_messages(target_date: Optional[date] = None) -> list:
     """สร้างข้อความเวรประจำวันสำหรับ reply หรือ push"""
     duty_date = target_date or datetime.now(BANGKOK_TZ).date()
     staff = get_staff(force=True, wait_if_empty=True)
-    team = 1 if duty_date.day % 2 == 0 else 2
+    team = duty_team_for_date(duty_date)
     people = duty_staff_by_team(team, staff)
 
     title = duty_title(duty_date, team) + " (ไม่รวมผู้ควบคุมชุด)"
@@ -1417,7 +1431,7 @@ def build_daily_duty_messages(target_date: Optional[date] = None) -> list:
 def build_daily_duty_prealert_messages(target_date: Optional[date] = None) -> list:
     """สร้างข้อความเตือนล่วงหน้าเวลา 09.00 น. ก่อนแจ้งรายชื่อเต็มเวลา 09.30 น."""
     duty_date = target_date or datetime.now(BANGKOK_TZ).date()
-    team = 1 if duty_date.day % 2 == 0 else 2
+    team = duty_team_for_date(duty_date)
     title = duty_title(duty_date, team) + " (ไม่รวมผู้ควบคุมชุด)"
     return [TextMessage(text=(
         "⏰ แจ้งเตือนล่วงหน้า เวลา 09.00 น.\n"
